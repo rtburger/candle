@@ -70,14 +70,27 @@ fn cuda_toolkit_path_trace_value() -> &'static str {
 }
 
 #[cfg(feature = "cuda-cutile")]
-fn cutile_kernel_name(dtype: GgmlDType, b_size: usize) -> &'static str {
-    match (dtype, b_size) {
-        (GgmlDType::Q4K, 1) => "q4k_q8_1_matvec_b1_f32",
-        (GgmlDType::Q4K, 2..=8) => "q4k_q8_1_matmul_batched_f32",
-        (GgmlDType::Q4K, 9..) => "q4k_q8_1_mmq_matmul_batched_f32",
-        (GgmlDType::Q6K, 1) => "q6k_q8_1_matvec_b1_f32",
-        (GgmlDType::Q6K, 2..=8) => "q6k_q8_1_matmul_batched_f32",
-        (GgmlDType::Q6K, 9..) => "q6k_q8_1_mmq_matmul_batched_f32",
+fn cutile_tiled_prefill_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_CUTILE_TILED")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+#[cfg(feature = "cuda-cutile")]
+fn cutile_kernel_name(dtype: GgmlDType, nrows: usize, b_size: usize) -> &'static str {
+    let use_tiled_q4k_mmq =
+        cutile_tiled_prefill_enabled() && nrows.is_multiple_of(4) && b_size.is_multiple_of(4);
+    match (dtype, b_size, use_tiled_q4k_mmq) {
+        (GgmlDType::Q4K, 1, _) => "q4k_q8_1_matvec_b1_f32",
+        (GgmlDType::Q4K, 2..=8, _) => "q4k_q8_1_matmul_batched_f32",
+        (GgmlDType::Q4K, 9.., true) => "q4k_q8_1_mmq_matmul_tiled_f32",
+        (GgmlDType::Q4K, 9.., false) => "q4k_q8_1_mmq_matmul_batched_f32",
+        (GgmlDType::Q6K, 1, _) => "q6k_q8_1_matvec_b1_f32",
+        (GgmlDType::Q6K, 2..=8, _) => "q6k_q8_1_matmul_batched_f32",
+        (GgmlDType::Q6K, 9.., _) => "q6k_q8_1_mmq_matmul_batched_f32",
         _ => "none",
     }
 }
@@ -946,7 +959,7 @@ impl QCudaStorage {
                     [b, _] => *b,
                     _ => 0,
                 };
-                let trace_kernel = cutile_kernel_name(self.dtype, trace_b_size);
+                let trace_kernel = cutile_kernel_name(self.dtype, trace_nrows, trace_b_size);
                 if !cuda_toolkit_path_is_set() {
                     if !quant_kernel_fallback_to_candle_enabled() {
                         crate::bail!(
