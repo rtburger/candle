@@ -88,6 +88,16 @@ fn cutile_mmai_prefill_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda-cutile")]
+fn cutile_q6k_b1_rows4_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS4")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+#[cfg(feature = "cuda-cutile")]
 fn cutile_kernel_name(dtype: GgmlDType, nrows: usize, b_size: usize) -> &'static str {
     let use_mmai_q4k_mmq = cutile_mmai_prefill_enabled()
         && nrows.is_multiple_of(16)
@@ -95,6 +105,13 @@ fn cutile_kernel_name(dtype: GgmlDType, nrows: usize, b_size: usize) -> &'static
         && b_size.is_multiple_of(4);
     let use_tiled_q4k_mmq =
         cutile_tiled_prefill_enabled() && nrows.is_multiple_of(4) && b_size.is_multiple_of(4);
+    if dtype == GgmlDType::Q6K
+        && b_size == 1
+        && cutile_q6k_b1_rows4_enabled()
+        && nrows.is_multiple_of(4)
+    {
+        return "q6k_q8_1_matvec_b1_rows4_f32";
+    }
     match (dtype, b_size, use_mmai_q4k_mmq, use_tiled_q4k_mmq) {
         (GgmlDType::Q4K, 1, _, _) => "q4k_q8_1_matvec_b1_f32",
         (GgmlDType::Q4K, 2..=8, _, _) => "q4k_q8_1_matmul_batched_f32",
