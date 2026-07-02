@@ -54,11 +54,27 @@ fn trace_quant_kernel(message: impl std::fmt::Display) {
 }
 
 #[cfg(feature = "cuda-cutile")]
+fn cuda_toolkit_path_is_set() -> bool {
+    std::env::var_os("CUDA_TOOLKIT_PATH")
+        .map(|value| !value.is_empty())
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "cuda-cutile")]
 fn cuda_toolkit_path_trace_value() -> &'static str {
-    if std::env::var_os("CUDA_TOOLKIT_PATH").is_some() {
+    if cuda_toolkit_path_is_set() {
         "set"
     } else {
         "unset"
+    }
+}
+
+#[cfg(feature = "cuda-cutile")]
+fn cutile_kernel_name(dtype: GgmlDType) -> &'static str {
+    match dtype {
+        GgmlDType::Q4K => "q4k_q8_1_matvec_b1_f32",
+        GgmlDType::Q6K => "q6k_q8_1_matvec_b1_f32",
+        _ => "none",
     }
 }
 
@@ -926,13 +942,34 @@ impl QCudaStorage {
                     [b, _] => *b,
                     _ => 0,
                 };
-                let cutile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    super::cuda_cutile::try_fwd(self, self_shape, storage, layout)
-                }));
-                match cutile_result {
-                    Ok(Ok(Some(result))) => {
-                        trace_quant_kernel(format_args!(
-                            "selected_backend=cutile actual_backend=cutile kernel=q4k_q8_1_matvec_b1_f32 dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                let trace_kernel = cutile_kernel_name(self.dtype);
+                if !cuda_toolkit_path_is_set() {
+                    if !quant_kernel_fallback_to_candle_enabled() {
+                        crate::bail!(
+                            "PI_CANDLE_QUANT_KERNEL=cutile requires CUDA_TOOLKIT_PATH to be set at runtime before cuTile compilation; set CUDA_TOOLKIT_PATH=/opt/cuda or set PI_CANDLE_QUANT_FALLBACK=candle to use Candle for this call"
+                        );
+                    }
+                    trace_quant_kernel(format_args!(
+                        "selected_backend=cutile actual_backend=candle kernel=none fallback_reason=missing_cuda_toolkit_path dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                        self.dtype,
+                        storage.dtype(),
+                        trace_nrows,
+                        trace_ncols,
+                        trace_b_size,
+                        cuda_toolkit_path_trace_value(),
+                        self_shape,
+                        layout.shape(),
+                    ));
+                } else {
+                    let cutile_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            super::cuda_cutile::try_fwd(self, self_shape, storage, layout)
+                        }));
+                    match cutile_result {
+                        Ok(Ok(Some(result))) => {
+                            trace_quant_kernel(format_args!(
+                            "selected_backend=cutile actual_backend=cutile kernel={} fallback_reason=none dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                            trace_kernel,
                             self.dtype,
                             storage.dtype(),
                             trace_nrows,
@@ -942,20 +979,20 @@ impl QCudaStorage {
                             self_shape,
                             layout.shape(),
                         ));
-                        return Ok(result);
-                    }
-                    Ok(Ok(None)) => {
-                        if !quant_kernel_fallback_to_candle_enabled() {
-                            crate::bail!(
+                            return Ok(result);
+                        }
+                        Ok(Ok(None)) => {
+                            if !quant_kernel_fallback_to_candle_enabled() {
+                                crate::bail!(
                                 "PI_CANDLE_QUANT_KERNEL=cutile does not support dtype {:?}, rhs dtype {:?}, weight shape {:?}, rhs shape {:?} yet; set PI_CANDLE_QUANT_FALLBACK=candle to use Candle for unsupported calls",
                                 self.dtype,
                                 storage.dtype(),
                                 self_shape,
                                 layout.shape(),
                             );
-                        }
-                        trace_quant_kernel(format_args!(
-                            "selected_backend=cutile actual_backend=candle fallback_reason=unsupported dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                            }
+                            trace_quant_kernel(format_args!(
+                            "selected_backend=cutile actual_backend=candle kernel=none fallback_reason=unsupported dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
                             self.dtype,
                             storage.dtype(),
                             trace_nrows,
@@ -965,13 +1002,14 @@ impl QCudaStorage {
                             self_shape,
                             layout.shape(),
                         ));
-                    }
-                    Ok(Err(error)) => {
-                        if !quant_kernel_fallback_to_candle_enabled() {
-                            return Err(error);
                         }
-                        trace_quant_kernel(format_args!(
-                            "selected_backend=cutile actual_backend=candle fallback_reason=cutile_error error={:?} dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                        Ok(Err(error)) => {
+                            if !quant_kernel_fallback_to_candle_enabled() {
+                                return Err(error);
+                            }
+                            trace_quant_kernel(format_args!(
+                            "selected_backend=cutile actual_backend=candle kernel={} fallback_reason=cutile_error error={:?} dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                            trace_kernel,
                             error.to_string(),
                             self.dtype,
                             storage.dtype(),
@@ -982,20 +1020,21 @@ impl QCudaStorage {
                             self_shape,
                             layout.shape(),
                         ));
-                    }
-                    Err(payload) => {
-                        let message = panic_payload_message(payload.as_ref());
-                        if !quant_kernel_fallback_to_candle_enabled() {
-                            crate::bail!(
+                        }
+                        Err(payload) => {
+                            let message = panic_payload_message(payload.as_ref());
+                            if !quant_kernel_fallback_to_candle_enabled() {
+                                crate::bail!(
                                 "PI_CANDLE_QUANT_KERNEL=cutile failed for dtype {:?}, rhs dtype {:?}, weight shape {:?}, rhs shape {:?}: {message}",
                                 self.dtype,
                                 storage.dtype(),
                                 self_shape,
                                 layout.shape(),
                             );
-                        }
-                        trace_quant_kernel(format_args!(
-                            "selected_backend=cutile actual_backend=candle fallback_reason=cutile_panic error={:?} dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                            }
+                            trace_quant_kernel(format_args!(
+                            "selected_backend=cutile actual_backend=candle kernel={} fallback_reason=cutile_panic error={:?} dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                            trace_kernel,
                             message,
                             self.dtype,
                             storage.dtype(),
@@ -1006,6 +1045,7 @@ impl QCudaStorage {
                             self_shape,
                             layout.shape(),
                         ));
+                        }
                     }
                 }
             }
