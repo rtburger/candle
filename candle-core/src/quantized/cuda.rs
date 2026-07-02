@@ -80,17 +80,30 @@ fn cutile_tiled_prefill_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda-cutile")]
+fn cutile_mmai_prefill_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_CUTILE_MMAI").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+#[cfg(feature = "cuda-cutile")]
 fn cutile_kernel_name(dtype: GgmlDType, nrows: usize, b_size: usize) -> &'static str {
+    let use_mmai_q4k_mmq = cutile_mmai_prefill_enabled()
+        && nrows.is_multiple_of(16)
+        && b_size >= 16
+        && b_size.is_multiple_of(4);
     let use_tiled_q4k_mmq =
         cutile_tiled_prefill_enabled() && nrows.is_multiple_of(4) && b_size.is_multiple_of(4);
-    match (dtype, b_size, use_tiled_q4k_mmq) {
-        (GgmlDType::Q4K, 1, _) => "q4k_q8_1_matvec_b1_f32",
-        (GgmlDType::Q4K, 2..=8, _) => "q4k_q8_1_matmul_batched_f32",
-        (GgmlDType::Q4K, 9.., true) => "q4k_q8_1_mmq_matmul_tiled_f32",
-        (GgmlDType::Q4K, 9.., false) => "q4k_q8_1_mmq_matmul_batched_f32",
-        (GgmlDType::Q6K, 1, _) => "q6k_q8_1_matvec_b1_f32",
-        (GgmlDType::Q6K, 2..=8, _) => "q6k_q8_1_matmul_batched_f32",
-        (GgmlDType::Q6K, 9.., _) => "q6k_q8_1_mmq_matmul_batched_f32",
+    match (dtype, b_size, use_mmai_q4k_mmq, use_tiled_q4k_mmq) {
+        (GgmlDType::Q4K, 1, _, _) => "q4k_q8_1_matvec_b1_f32",
+        (GgmlDType::Q4K, 2..=8, _, _) => "q4k_q8_1_matmul_batched_f32",
+        (GgmlDType::Q4K, 9.., true, _) => "q4k_q8_1_mmq_matmul_mmai_16x16_f32",
+        (GgmlDType::Q4K, 9.., false, true) => "q4k_q8_1_mmq_matmul_tiled_f32",
+        (GgmlDType::Q4K, 9.., false, false) => "q4k_q8_1_mmq_matmul_batched_f32",
+        (GgmlDType::Q6K, 1, _, _) => "q6k_q8_1_matvec_b1_f32",
+        (GgmlDType::Q6K, 2..=8, _, _) => "q6k_q8_1_matmul_batched_f32",
+        (GgmlDType::Q6K, 9.., _, _) => "q6k_q8_1_mmq_matmul_batched_f32",
         _ => "none",
     }
 }
