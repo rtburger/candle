@@ -76,6 +76,8 @@ fn cutile_kernel_name(dtype: GgmlDType, b_size: usize) -> &'static str {
         (GgmlDType::Q4K, 2..=8) => "q4k_q8_1_matmul_batched_f32",
         (GgmlDType::Q4K, 9..) => "q4k_q8_1_mmq_matmul_batched_f32",
         (GgmlDType::Q6K, 1) => "q6k_q8_1_matvec_b1_f32",
+        (GgmlDType::Q6K, 2..=8) => "q6k_q8_1_matmul_batched_f32",
+        (GgmlDType::Q6K, 9..) => "q6k_q8_1_mmq_matmul_batched_f32",
         _ => "none",
     }
 }
