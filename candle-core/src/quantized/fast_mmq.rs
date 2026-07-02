@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 
 use super::cuda::{QCudaStorage, MATRIX_ROW_PADDING};
 use super::GgmlDType;
-use crate::cuda_backend::DeviceId;
+use crate::cuda_backend::{DeviceId, WrapErr};
 use crate::{backend::BackendStorage, CudaDevice, CudaStorage, DType, Result, Shape};
 
 use cudarc::driver::{CudaSlice, DevicePtr};
@@ -17,6 +17,50 @@ const BLOCK_Q8_1_MMQ_SIZE: usize = 4 * QK8_1 + 4 * 4; // 128 qs + 16 scale bytes
 #[inline]
 fn pad(p: usize, q: usize) -> usize {
     p.div_ceil(q) * q
+}
+
+fn fast_mmq_trace_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_TRACE").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn trace_fast_mmq_measurement(message: impl std::fmt::Display) {
+    if fast_mmq_trace_enabled() {
+        eprintln!("candle quant-kernel {message}");
+    }
+}
+
+fn record_timing_event(
+    stream: &cudarc::driver::CudaStream,
+    enabled: bool,
+) -> Result<Option<cudarc::driver::CudaEvent>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let event = stream
+        .context()
+        .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+        .w()?;
+    event.record(stream).w()?;
+    Ok(Some(event))
+}
+
+fn elapsed_timing_ms(
+    events: &Option<(cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)>,
+) -> Result<Option<f32>> {
+    match events {
+        Some((start, end)) => Ok(Some(start.elapsed_ms(end).w()?)),
+        None => Ok(None),
+    }
+}
+
+fn fmt_timing_ms(value: Option<f32>) -> String {
+    match value {
+        Some(value) => format!("{value:.3}"),
+        None => "n/a".to_string(),
+    }
 }
 
 /// Quant types supported by MMQ kernels (same as MMVQ).
@@ -346,6 +390,9 @@ pub fn try_fwd(
 
     let out_ptr = out.device_ptr(&stream).0 as *mut std::ffi::c_void;
 
+    let timing_enabled = fast_mmq_trace_enabled();
+    let total_start_event = record_timing_event(&stream, timing_enabled)?;
+    let q8_quant_start_event = record_timing_event(&stream, timing_enabled)?;
     unsafe {
         let quantize = quantize_launcher(ds_layout_for(w_dtype));
         quantize(
@@ -363,7 +410,12 @@ pub fn try_fwd(
             1,
             stream_ptr,
         );
+    }
+    let q8_quant_end_event = record_timing_event(&stream, timing_enabled)?;
+    let q8_quant_events = q8_quant_start_event.zip(q8_quant_end_event);
 
+    let mmq_matmul_start_event = record_timing_event(&stream, timing_enabled)?;
+    unsafe {
         let launcher = mmq_launcher(w_dtype).expect("supports() checked");
         launcher(
             fixup_ptr,
@@ -381,6 +433,27 @@ pub fn try_fwd(
             di.warp_size,
             stream_ptr,
         );
+    }
+    let mmq_matmul_end_event = record_timing_event(&stream, timing_enabled)?;
+    let mmq_matmul_events = mmq_matmul_start_event.zip(mmq_matmul_end_event);
+    let total_end_event = record_timing_event(&stream, timing_enabled)?;
+
+    if timing_enabled {
+        let total_gpu_events = total_start_event.zip(total_end_event);
+        let q8_quant_ms = elapsed_timing_ms(&q8_quant_events)?;
+        let mmq_matmul_ms = elapsed_timing_ms(&mmq_matmul_events)?;
+        let total_gpu_ms = elapsed_timing_ms(&total_gpu_events)?;
+        trace_fast_mmq_measurement(format_args!(
+            "fast_mmq_timing dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} q8_quant_ms={} mmq_matmul_ms={} total_gpu_ms={}",
+            w_dtype,
+            input_dtype,
+            nrows,
+            k,
+            b_size,
+            fmt_timing_ms(q8_quant_ms),
+            fmt_timing_ms(mmq_matmul_ms),
+            fmt_timing_ms(total_gpu_ms),
+        ));
     }
 
     let mut out_shape = rhs_l.shape().dims().to_vec();

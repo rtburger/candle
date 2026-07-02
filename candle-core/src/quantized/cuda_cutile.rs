@@ -10,8 +10,12 @@ use super::cuda::{QCudaStorage, MATRIX_ROW_PADDING};
 use super::GgmlDType;
 use crate::{
     backend::{BackendDevice, BackendStorage},
+    cuda_backend::DeviceId,
     CudaDevice, CudaStorage, DType, Result, Shape,
 };
+use cudarc::driver::CudaSlice;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 const QK_K: usize = 256;
 const Q8_1_BLOCK_SIZE: usize = 32;
@@ -91,6 +95,44 @@ fn fmt_host_ms(value: Option<f64>) -> String {
         Some(value) => format!("{value:.3}"),
         None => "n/a".to_string(),
     }
+}
+
+struct Q8ScratchWorkspaceSlot {
+    slice: CudaSlice<u8>,
+    cap: usize,
+}
+
+type Q8ScratchWorkspaceMap = Mutex<HashMap<DeviceId, &'static Mutex<Q8ScratchWorkspaceSlot>>>;
+
+static Q8_SCRATCH_WORKSPACE: OnceLock<Q8ScratchWorkspaceMap> = OnceLock::new();
+
+fn q8_scratch_workspace_ensure(
+    dev: &CudaDevice,
+    bytes: usize,
+) -> Result<std::sync::MutexGuard<'static, Q8ScratchWorkspaceSlot>> {
+    let map = Q8_SCRATCH_WORKSPACE.get_or_init(|| Mutex::new(HashMap::new()));
+    let device_key = dev.id();
+    let device_mtx: &'static Mutex<Q8ScratchWorkspaceSlot> = {
+        let mut guard = map.lock().unwrap();
+        match guard.get(&device_key).copied() {
+            Some(mtx) => mtx,
+            None => {
+                let slice = unsafe { dev.alloc::<u8>(bytes.max(1))? };
+                let leaked = Box::leak(Box::new(Mutex::new(Q8ScratchWorkspaceSlot {
+                    slice,
+                    cap: bytes.max(1),
+                })));
+                guard.insert(device_key, leaked);
+                leaked
+            }
+        }
+    };
+    let mut slot = device_mtx.lock().unwrap();
+    if slot.cap < bytes {
+        slot.slice = unsafe { dev.alloc::<u8>(bytes.max(1))? };
+        slot.cap = bytes.max(1);
+    }
+    Ok(slot)
 }
 
 #[cutile::module]
@@ -1184,15 +1226,25 @@ mod q4k_q8_1_mmq_matmul_tiled_kernel {
             }
         }
 
+        let out_lanes16: Tile<i32, { [16] }> = iota(const_shape![16]);
+        let out_batch_local16: Tile<i32, { [16] }> = out_lanes16 / constant(4i32, const_shape![16]);
+        let out_row_local16: Tile<i32, { [16] }> =
+            out_lanes16 - out_batch_local16 * constant(4i32, const_shape![16]);
+        let out_rows16: Tile<i32, { [16] }> =
+            out_row_local16 + broadcast_scalar(row_tile * 4i32, const_shape![16]);
+        let out_batches16: Tile<i32, { [16] }> =
+            out_batch_local16 + broadcast_scalar(batch_start + batch_tile * 4i32, const_shape![16]);
         let out_offsets: Tile<i32, { [16] }> =
-            rows16 + batches16 * broadcast_scalar(nrows, const_shape![16]);
+            out_rows16 + out_batches16 * broadcast_scalar(nrows, const_shape![16]);
         let out_base: PointerTile<*mut f32, { [] }> = pointer_to_tile(out_ptr);
         let out_1: PointerTile<*mut f32, { [1] }> = out_base.reshape(const_shape![1]);
         let out_16: PointerTile<*mut f32, { [16] }> = out_1.broadcast(const_shape![16]);
         let out_dst: PointerTile<*mut f32, { [16] }> = out_16.offset_tile(out_offsets);
+        let acc_4x4: Tile<f32, { [4, 4] }> = acc.reshape(const_shape![4, 4]);
+        let acc_batch_major: Tile<f32, { [16] }> = acc_4x4.transpose().reshape(const_shape![16]);
         store_ptr_tko(
             out_dst,
-            acc,
+            acc_batch_major,
             ordering::Weak,
             None::<scope::TileBlock>,
             None,
@@ -1663,10 +1715,10 @@ mod q4k_q8_1_mmq_matmul_mmai_kernel {
         }
 
         let out_lanes256: Tile<i32, { [256] }> = iota(const_shape![256]);
-        let out_row_local256: Tile<i32, { [256] }> =
-            out_lanes256 / constant(16i32, const_shape![256]);
         let out_batch_local256: Tile<i32, { [256] }> =
-            out_lanes256 - out_row_local256 * constant(16i32, const_shape![256]);
+            out_lanes256 / constant(16i32, const_shape![256]);
+        let out_row_local256: Tile<i32, { [256] }> =
+            out_lanes256 - out_batch_local256 * constant(16i32, const_shape![256]);
         let out_rows256: Tile<i32, { [256] }> =
             out_row_local256 + broadcast_scalar(row_base, const_shape![256]);
         let out_batches256: Tile<i32, { [256] }> =
@@ -1677,9 +1729,10 @@ mod q4k_q8_1_mmq_matmul_mmai_kernel {
         let out_1: PointerTile<*mut f32, { [1] }> = out_base_ptr.reshape(const_shape![1]);
         let out_256: PointerTile<*mut f32, { [256] }> = out_1.broadcast(const_shape![256]);
         let out_dst: PointerTile<*mut f32, { [256] }> = out_256.offset_tile(out_offsets);
+        let acc_batch_major: Tile<f32, { [256] }> = acc.transpose().reshape(const_shape![256]);
         store_ptr_tko(
             out_dst,
-            acc.reshape(const_shape![256]),
+            acc_batch_major,
             ordering::Weak,
             None::<scope::TileBlock>,
             None,
@@ -2377,7 +2430,7 @@ pub(crate) fn try_fwd(
         (ncols_padded / Q8_1_BLOCK_SIZE) * Q8_1_BLOCK_BYTES
     };
     let scratch_bytes = b_size * q8_row_stride_bytes;
-    let mut scratch = unsafe { dev.alloc::<u8>(scratch_bytes)? };
+    let mut scratch_guard = q8_scratch_workspace_ensure(dev, scratch_bytes)?;
     let mut out = unsafe { dev.alloc::<f32>(nrows * b_size)? };
 
     let timing_enabled = cutile_trace_enabled();
@@ -2387,9 +2440,13 @@ pub(crate) fn try_fwd(
     let q8_quant_events;
     let mut q4k_mmai_main_events = None;
     let mut q4k_mmai_tail_events = None;
+    let mut q4k_scalar_mmq_events = None;
+    let mut q4k_tiled_mmq_events = None;
     let mut q6k_mmq_events = None;
     let mut q4k_mmai_main_host_ms = None;
     let mut q4k_mmai_tail_host_ms = None;
+    let mut q4k_scalar_mmq_host_ms = None;
+    let mut q4k_tiled_mmq_host_ms = None;
     let mut q6k_mmq_host_ms = None;
     let trace_main_kernel: &'static str;
     let trace_tail_kernel: &'static str;
@@ -2397,7 +2454,7 @@ pub(crate) fn try_fwd(
     let trace_tail_b_size: usize;
 
     {
-        let (scratch_ptr, scratch_write) = scratch.device_ptr_mut(&stream);
+        let (scratch_ptr, scratch_write) = scratch_guard.slice.device_ptr_mut(&stream);
         let q8_quant_start_event = record_timing_event(&stream, timing_enabled)?;
         unsafe {
             if use_mmq_q8_layout {
@@ -2598,6 +2655,8 @@ pub(crate) fn try_fwd(
                         trace_tail_kernel = "none";
                         trace_main_b_size = b_size;
                         trace_tail_b_size = 0;
+                        let q4k_tiled_mmq_start_event =
+                            record_timing_event(&stream, timing_enabled)?;
                         let op = unsafe {
                             q4k_q8_1_mmq_matmul_tiled_kernel::q4k_q8_1_mmq_matmul_tiled_f32(
                                 qweight_cutile,
@@ -2614,7 +2673,13 @@ pub(crate) fn try_fwd(
                         // SAFETY: same Candle-owned allocation and stream-ordering argument
                         // as the scalar baseline, but each cuTile program owns a disjoint
                         // 4-row by 4-RHS output tile.
+                        let q4k_tiled_mmq_host_start = std::time::Instant::now();
                         unsafe { op.async_on(&cutile_stream) }.map_err(cutile_err)?;
+                        q4k_tiled_mmq_host_ms =
+                            Some(q4k_tiled_mmq_host_start.elapsed().as_secs_f64() * 1000.0);
+                        let q4k_tiled_mmq_end_event = record_timing_event(&stream, timing_enabled)?;
+                        q4k_tiled_mmq_events =
+                            q4k_tiled_mmq_start_event.zip(q4k_tiled_mmq_end_event);
                     } else if use_mmq_q8_layout {
                         let qweight_cutile = unsafe {
                             DevicePointer::<u8>::from_cu_deviceptr(
@@ -2635,6 +2700,8 @@ pub(crate) fn try_fwd(
                         trace_tail_kernel = "none";
                         trace_main_b_size = b_size;
                         trace_tail_b_size = 0;
+                        let q4k_scalar_mmq_start_event =
+                            record_timing_event(&stream, timing_enabled)?;
                         let op = unsafe {
                             q4k_q8_1_mmq_matmul_batched_kernel::q4k_q8_1_mmq_matmul_batched_f32(
                                 qweight_cutile,
@@ -2650,7 +2717,14 @@ pub(crate) fn try_fwd(
 
                         // SAFETY: same Candle-owned allocation and stream-ordering argument
                         // as the decode launch above, using Candle's MMQ Q8_1 scratch layout.
+                        let q4k_scalar_mmq_host_start = std::time::Instant::now();
                         unsafe { op.async_on(&cutile_stream) }.map_err(cutile_err)?;
+                        q4k_scalar_mmq_host_ms =
+                            Some(q4k_scalar_mmq_host_start.elapsed().as_secs_f64() * 1000.0);
+                        let q4k_scalar_mmq_end_event =
+                            record_timing_event(&stream, timing_enabled)?;
+                        q4k_scalar_mmq_events =
+                            q4k_scalar_mmq_start_event.zip(q4k_scalar_mmq_end_event);
                     } else {
                         let qweight_cutile = unsafe {
                             DevicePointer::<u8>::from_cu_deviceptr(
@@ -2819,11 +2893,13 @@ pub(crate) fn try_fwd(
         let q8_quant_ms = elapsed_timing_ms(&q8_quant_events)?;
         let q4k_mmai_main_ms = elapsed_timing_ms(&q4k_mmai_main_events)?;
         let q4k_mmai_tail_ms = elapsed_timing_ms(&q4k_mmai_tail_events)?;
+        let q4k_scalar_mmq_ms = elapsed_timing_ms(&q4k_scalar_mmq_events)?;
+        let q4k_tiled_mmq_ms = elapsed_timing_ms(&q4k_tiled_mmq_events)?;
         let q6k_mmq_ms = elapsed_timing_ms(&q6k_mmq_events)?;
         let total_gpu_ms = elapsed_timing_ms(&total_gpu_events)?;
         let total_host_ms = total_host_start.elapsed().as_secs_f64() * 1000.0;
         trace_cutile_measurement(format_args!(
-            "cutile_timing dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} main_kernel={} tail_kernel={} main_b_size={} tail_b_size={} q8_quant_ms={} q4k_mmai_main_ms={} q4k_mmai_tail_ms={} q6k_mmq_ms={} total_gpu_ms={} q4k_mmai_main_host_submit_or_jit_ms={} q4k_mmai_tail_host_submit_or_jit_ms={} q6k_mmq_host_submit_or_jit_ms={} total_host_submit_or_jit_ms={:.3}",
+            "cutile_timing dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} main_kernel={} tail_kernel={} main_b_size={} tail_b_size={} q8_quant_ms={} q4k_mmai_main_ms={} q4k_mmai_tail_ms={} q4k_scalar_mmq_ms={} q4k_tiled_mmq_ms={} q6k_mmq_ms={} total_gpu_ms={} q4k_mmai_main_host_submit_or_jit_ms={} q4k_mmai_tail_host_submit_or_jit_ms={} q4k_scalar_mmq_host_submit_or_jit_ms={} q4k_tiled_mmq_host_submit_or_jit_ms={} q6k_mmq_host_submit_or_jit_ms={} total_host_submit_or_jit_ms={:.3}",
             w_dtype,
             rhs.dtype(),
             nrows,
@@ -2836,10 +2912,14 @@ pub(crate) fn try_fwd(
             fmt_timing_ms(q8_quant_ms),
             fmt_timing_ms(q4k_mmai_main_ms),
             fmt_timing_ms(q4k_mmai_tail_ms),
+            fmt_timing_ms(q4k_scalar_mmq_ms),
+            fmt_timing_ms(q4k_tiled_mmq_ms),
             fmt_timing_ms(q6k_mmq_ms),
             fmt_timing_ms(total_gpu_ms),
             fmt_host_ms(q4k_mmai_main_host_ms),
             fmt_host_ms(q4k_mmai_tail_host_ms),
+            fmt_host_ms(q4k_scalar_mmq_host_ms),
+            fmt_host_ms(q4k_tiled_mmq_host_ms),
             fmt_host_ms(q6k_mmq_host_ms),
             total_host_ms,
         ));
