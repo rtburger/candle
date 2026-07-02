@@ -16,6 +16,7 @@ use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCac
 use candle_nn::{Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
@@ -45,6 +46,89 @@ impl<R: Read + Seek> Gguf<R> {
     pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
+}
+
+fn rope_kv_trace_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_TRACE").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn record_rope_kv_event(
+    device: &Device,
+) -> Result<Option<candle::cuda_backend::cudarc::driver::CudaEvent>> {
+    let Device::Cuda(cuda) = device else {
+        return Ok(None);
+    };
+    let stream = cuda.cuda_stream();
+    let event = stream
+        .context()
+        .new_event(Some(
+            candle::cuda_backend::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+        ))
+        .map_err(|err| candle::Error::Cuda(Box::new(err)))?;
+    event
+        .record(&stream)
+        .map_err(|err| candle::Error::Cuda(Box::new(err)))?;
+    Ok(Some(event))
+}
+
+fn fmt_optional_ms(ms: Option<f32>) -> String {
+    match ms {
+        Some(ms) => format!("{ms:.3}"),
+        None => "n/a".to_string(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_rope_kv_timed<T>(
+    device: &Device,
+    op: &'static str,
+    phase: &'static str,
+    b: usize,
+    seq_len: usize,
+    offset: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !rope_kv_trace_enabled() {
+        return f();
+    }
+
+    let host_start = Instant::now();
+    #[cfg(feature = "cuda")]
+    let start_event = record_rope_kv_event(device)?;
+    #[cfg(not(feature = "cuda"))]
+    let _ = device;
+
+    let value = f()?;
+
+    #[cfg(feature = "cuda")]
+    let gpu_ms = {
+        let end_event = record_rope_kv_event(device)?;
+        match (start_event, end_event) {
+            (Some(start), Some(end)) => Some(
+                start
+                    .elapsed_ms(&end)
+                    .map_err(|err| candle::Error::Cuda(Box::new(err)))?,
+            ),
+            _ => None,
+        }
+    };
+    #[cfg(not(feature = "cuda"))]
+    let gpu_ms = None;
+
+    let host_ms = host_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "candle rope-kv_timing op={op} phase={phase} b={b} seq_len={seq_len} offset={offset} num_heads={num_heads} num_kv_heads={num_kv_heads} head_dim={head_dim} gpu_ms={} host_ms={host_ms:.3}",
+        fmt_optional_ms(gpu_ms),
+    );
+
+    Ok(value)
 }
 
 #[derive(Debug, Clone)]
@@ -263,7 +347,23 @@ impl AttentionWeights {
         let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
 
         // RoPE
-        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+        let phase = if l == 1 && offset > 0 {
+            "decode"
+        } else {
+            "prefill"
+        };
+        let (q, k) = trace_rope_kv_timed(
+            x.device(),
+            "rope",
+            phase,
+            b,
+            l,
+            offset,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            || self.rotary_emb.apply(&q, &k, offset),
+        )?;
 
         // TODO: b > 1 needs varlen CPU flash with interleaved cache support.
         if x.device().is_cpu() && b == 1 {
@@ -354,7 +454,18 @@ impl AttentionWeights {
             }
         } else {
             // Standard matmul attention (no flash)
-            let (k, v) = self.kv_cache.as_mut().unwrap().append(&k, &v)?;
+            let (k, v) = trace_rope_kv_timed(
+                x.device(),
+                "kv_append",
+                phase,
+                b,
+                l,
+                offset,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                || self.kv_cache.as_mut().unwrap().append(&k, &v),
+            )?;
 
             let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
             let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
