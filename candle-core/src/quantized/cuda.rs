@@ -1,10 +1,77 @@
 use super::{GgmlDType, QStorage};
+#[cfg(feature = "cuda-cutile")]
+use crate::backend::BackendStorage;
 use crate::quantized::k_quants::GgmlType;
 use crate::{backend::BackendDevice, cuda_backend::WrapErr};
 use crate::{builder_arg as barg, CudaDevice, CudaStorage, Result};
 use half::f16;
 
 use cudarc::driver::{CudaSlice, CudaStream, CudaView, DevicePtr, PushKernelArg, SyncOnDrop};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuantKernelBackend {
+    Candle,
+    Cutile,
+}
+
+fn selected_quant_kernel_backend() -> Result<QuantKernelBackend> {
+    match std::env::var("PI_CANDLE_QUANT_KERNEL") {
+        Ok(value) => match value.as_str() {
+            "" | "candle" => Ok(QuantKernelBackend::Candle),
+            "cutile" | "cuda-cutile" | "cuda_cutile" => Ok(QuantKernelBackend::Cutile),
+            other => crate::bail!(
+                "invalid PI_CANDLE_QUANT_KERNEL value {other:?}; expected candle or cutile"
+            ),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(QuantKernelBackend::Candle),
+        Err(std::env::VarError::NotUnicode(value)) => crate::bail!(
+            "invalid PI_CANDLE_QUANT_KERNEL value {value:?}; expected candle or cutile"
+        ),
+    }
+}
+
+#[cfg(feature = "cuda-cutile")]
+fn quant_kernel_fallback_to_candle_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_FALLBACK").ok().as_deref(),
+        Some("candle")
+    )
+}
+
+#[cfg(feature = "cuda-cutile")]
+fn quant_kernel_trace_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_TRACE").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+#[cfg(feature = "cuda-cutile")]
+fn trace_quant_kernel(message: impl std::fmt::Display) {
+    if quant_kernel_trace_enabled() {
+        eprintln!("candle quant-kernel {message}");
+    }
+}
+
+#[cfg(feature = "cuda-cutile")]
+fn cuda_toolkit_path_trace_value() -> &'static str {
+    if std::env::var_os("CUDA_TOOLKIT_PATH").is_some() {
+        "set"
+    } else {
+        "unset"
+    }
+}
+
+#[cfg(feature = "cuda-cutile")]
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
 
 #[derive(Clone, Debug)]
 struct PaddedCudaSlice {
@@ -849,6 +916,107 @@ impl QCudaStorage {
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        let selected_backend = selected_quant_kernel_backend()?;
+        if selected_backend == QuantKernelBackend::Cutile {
+            #[cfg(feature = "cuda-cutile")]
+            {
+                let (trace_nrows, trace_ncols) = self_shape.dims2().unwrap_or((0, 0));
+                let trace_b_size = match layout.shape().dims() {
+                    [b, m, _] => b * m,
+                    [b, _] => *b,
+                    _ => 0,
+                };
+                let cutile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    super::cuda_cutile::try_fwd(self, self_shape, storage, layout)
+                }));
+                match cutile_result {
+                    Ok(Ok(Some(result))) => {
+                        trace_quant_kernel(format_args!(
+                            "selected_backend=cutile actual_backend=cutile kernel=q4k_q8_1_matvec_b1_f32 dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                            self.dtype,
+                            storage.dtype(),
+                            trace_nrows,
+                            trace_ncols,
+                            trace_b_size,
+                            cuda_toolkit_path_trace_value(),
+                            self_shape,
+                            layout.shape(),
+                        ));
+                        return Ok(result);
+                    }
+                    Ok(Ok(None)) => {
+                        if !quant_kernel_fallback_to_candle_enabled() {
+                            crate::bail!(
+                                "PI_CANDLE_QUANT_KERNEL=cutile does not support dtype {:?}, rhs dtype {:?}, weight shape {:?}, rhs shape {:?} yet; set PI_CANDLE_QUANT_FALLBACK=candle to use Candle for unsupported calls",
+                                self.dtype,
+                                storage.dtype(),
+                                self_shape,
+                                layout.shape(),
+                            );
+                        }
+                        trace_quant_kernel(format_args!(
+                            "selected_backend=cutile actual_backend=candle fallback_reason=unsupported dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                            self.dtype,
+                            storage.dtype(),
+                            trace_nrows,
+                            trace_ncols,
+                            trace_b_size,
+                            cuda_toolkit_path_trace_value(),
+                            self_shape,
+                            layout.shape(),
+                        ));
+                    }
+                    Ok(Err(error)) => {
+                        if !quant_kernel_fallback_to_candle_enabled() {
+                            return Err(error);
+                        }
+                        trace_quant_kernel(format_args!(
+                            "selected_backend=cutile actual_backend=candle fallback_reason=cutile_error error={:?} dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                            error.to_string(),
+                            self.dtype,
+                            storage.dtype(),
+                            trace_nrows,
+                            trace_ncols,
+                            trace_b_size,
+                            cuda_toolkit_path_trace_value(),
+                            self_shape,
+                            layout.shape(),
+                        ));
+                    }
+                    Err(payload) => {
+                        let message = panic_payload_message(payload.as_ref());
+                        if !quant_kernel_fallback_to_candle_enabled() {
+                            crate::bail!(
+                                "PI_CANDLE_QUANT_KERNEL=cutile failed for dtype {:?}, rhs dtype {:?}, weight shape {:?}, rhs shape {:?}: {message}",
+                                self.dtype,
+                                storage.dtype(),
+                                self_shape,
+                                layout.shape(),
+                            );
+                        }
+                        trace_quant_kernel(format_args!(
+                            "selected_backend=cutile actual_backend=candle fallback_reason=cutile_panic error={:?} dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                            message,
+                            self.dtype,
+                            storage.dtype(),
+                            trace_nrows,
+                            trace_ncols,
+                            trace_b_size,
+                            cuda_toolkit_path_trace_value(),
+                            self_shape,
+                            layout.shape(),
+                        ));
+                    }
+                }
+            }
+            #[cfg(not(feature = "cuda-cutile"))]
+            {
+                crate::bail!(
+                    "PI_CANDLE_QUANT_KERNEL=cutile requested, but candle-core was built without the cuda-cutile feature"
+                );
+            }
+        }
+
         // Optimized MMVQ and MMQ paths (support most paths: BF16/F16/F32, batch 1-8, all quant types, reuses per-device workspace).
         if !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(result) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
