@@ -70,10 +70,12 @@ fn cuda_toolkit_path_trace_value() -> &'static str {
 }
 
 #[cfg(feature = "cuda-cutile")]
-fn cutile_kernel_name(dtype: GgmlDType) -> &'static str {
-    match dtype {
-        GgmlDType::Q4K => "q4k_q8_1_matvec_b1_f32",
-        GgmlDType::Q6K => "q6k_q8_1_matvec_b1_f32",
+fn cutile_kernel_name(dtype: GgmlDType, b_size: usize) -> &'static str {
+    match (dtype, b_size) {
+        (GgmlDType::Q4K, 1) => "q4k_q8_1_matvec_b1_f32",
+        (GgmlDType::Q4K, 2..=8) => "q4k_q8_1_matmul_batched_f32",
+        (GgmlDType::Q4K, 9..) => "q4k_q8_1_mmq_matmul_batched_f32",
+        (GgmlDType::Q6K, 1) => "q6k_q8_1_matvec_b1_f32",
         _ => "none",
     }
 }
@@ -942,7 +944,7 @@ impl QCudaStorage {
                     [b, _] => *b,
                     _ => 0,
                 };
-                let trace_kernel = cutile_kernel_name(self.dtype);
+                let trace_kernel = cutile_kernel_name(self.dtype, trace_b_size);
                 if !cuda_toolkit_path_is_set() {
                     if !quant_kernel_fallback_to_candle_enabled() {
                         crate::bail!(
