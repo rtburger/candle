@@ -22,6 +22,8 @@ mod metal {
 }
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "cuda-cutile")]
+pub mod cuda_cutile;
 #[cfg(feature = "cuda")]
 pub mod fast_mmq;
 #[cfg(feature = "cuda")]
