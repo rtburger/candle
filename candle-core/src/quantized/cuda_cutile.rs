@@ -40,6 +40,59 @@ fn mmai_prefill_enabled() -> bool {
     )
 }
 
+fn cutile_trace_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_TRACE").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn trace_cutile_measurement(message: impl std::fmt::Display) {
+    if cutile_trace_enabled() {
+        eprintln!("candle quant-kernel {message}");
+    }
+}
+
+fn record_timing_event(
+    stream: &cudarc::driver::CudaStream,
+    enabled: bool,
+) -> Result<Option<cudarc::driver::CudaEvent>> {
+    if !enabled {
+        return Ok(None);
+    }
+    use crate::cuda_backend::WrapErr;
+    let event = stream
+        .context()
+        .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+        .w()?;
+    event.record(stream).w()?;
+    Ok(Some(event))
+}
+
+fn elapsed_timing_ms(
+    events: &Option<(cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)>,
+) -> Result<Option<f32>> {
+    use crate::cuda_backend::WrapErr;
+    match events {
+        Some((start, end)) => Ok(Some(start.elapsed_ms(end).w()?)),
+        None => Ok(None),
+    }
+}
+
+fn fmt_timing_ms(value: Option<f32>) -> String {
+    match value {
+        Some(value) => format!("{value:.3}"),
+        None => "n/a".to_string(),
+    }
+}
+
+fn fmt_host_ms(value: Option<f64>) -> String {
+    match value {
+        Some(value) => format!("{value:.3}"),
+        None => "n/a".to_string(),
+    }
+}
+
 #[cutile::module]
 mod mmai_probe_kernel {
     use cutile::core::*;
@@ -2327,8 +2380,25 @@ pub(crate) fn try_fwd(
     let mut scratch = unsafe { dev.alloc::<u8>(scratch_bytes)? };
     let mut out = unsafe { dev.alloc::<f32>(nrows * b_size)? };
 
+    let timing_enabled = cutile_trace_enabled();
+    let total_host_start = std::time::Instant::now();
+    let total_start_event = record_timing_event(&stream, timing_enabled)?;
+    let total_end_event;
+    let q8_quant_events;
+    let mut q4k_mmai_main_events = None;
+    let mut q4k_mmai_tail_events = None;
+    let mut q6k_mmq_events = None;
+    let mut q4k_mmai_main_host_ms = None;
+    let mut q4k_mmai_tail_host_ms = None;
+    let mut q6k_mmq_host_ms = None;
+    let trace_main_kernel: &'static str;
+    let trace_tail_kernel: &'static str;
+    let trace_main_b_size: usize;
+    let trace_tail_b_size: usize;
+
     {
         let (scratch_ptr, scratch_write) = scratch.device_ptr_mut(&stream);
+        let q8_quant_start_event = record_timing_event(&stream, timing_enabled)?;
         unsafe {
             if use_mmq_q8_layout {
                 let quantize = match w_dtype {
@@ -2362,6 +2432,8 @@ pub(crate) fn try_fwd(
                 );
             }
         }
+        let q8_quant_end_event = record_timing_event(&stream, timing_enabled)?;
+        q8_quant_events = q8_quant_start_event.zip(q8_quant_end_event);
 
         let (qweight_ptr, qweight_read) = qstorage.device_ptr_with_guard(&stream)?;
         let (out_ptr, out_write) = out.device_ptr_mut(&stream);
@@ -2371,6 +2443,10 @@ pub(crate) fn try_fwd(
             match w_dtype {
                 GgmlDType::Q4K => {
                     if b_size == 1 {
+                        trace_main_kernel = "q4k_q8_1_matvec_b1_f32";
+                        trace_tail_kernel = "none";
+                        trace_main_b_size = b_size;
+                        trace_tail_b_size = 0;
                         let qweight_cutile = unsafe {
                             DevicePointer::<u8>::from_cu_deviceptr(
                                 qweight_ptr as cutile::cuda_core::sys::CUdeviceptr,
@@ -2426,6 +2502,18 @@ pub(crate) fn try_fwd(
                             )
                         };
                         let main_b_size = (b_size / 16) * 16;
+                        let tail_b_size = b_size - main_b_size;
+                        trace_main_kernel = "q4k_q8_1_mmq_matmul_mmai_16x16_f32";
+                        trace_tail_kernel = if tail_b_size != 0 {
+                            "q4k_q8_1_mmq_matmul_tiled_f32"
+                        } else {
+                            "none"
+                        };
+                        trace_main_b_size = main_b_size;
+                        trace_tail_b_size = tail_b_size;
+
+                        let q4k_mmai_main_start_event =
+                            record_timing_event(&stream, timing_enabled)?;
                         let op = unsafe {
                             q4k_q8_1_mmq_matmul_mmai_kernel::q4k_q8_1_mmq_matmul_mmai_16x16_f32(
                                 qweight_cutile,
@@ -2447,10 +2535,17 @@ pub(crate) fn try_fwd(
                         // as the scalar baseline, but each cuTile program owns a disjoint
                         // 16-row by 16-RHS output tile and the optional tail below writes
                         // non-overlapping RHS columns.
+                        let q4k_mmai_main_host_start = std::time::Instant::now();
                         unsafe { op.async_on(&cutile_stream) }.map_err(cutile_err)?;
+                        q4k_mmai_main_host_ms =
+                            Some(q4k_mmai_main_host_start.elapsed().as_secs_f64() * 1000.0);
+                        let q4k_mmai_main_end_event = record_timing_event(&stream, timing_enabled)?;
+                        q4k_mmai_main_events =
+                            q4k_mmai_main_start_event.zip(q4k_mmai_main_end_event);
 
-                        let tail_b_size = b_size - main_b_size;
                         if tail_b_size != 0 {
+                            let q4k_mmai_tail_start_event =
+                                record_timing_event(&stream, timing_enabled)?;
                             let op = unsafe {
                                 q4k_q8_1_mmq_matmul_tiled_kernel::q4k_q8_1_mmq_matmul_tiled_f32(
                                     qweight_cutile,
@@ -2470,7 +2565,14 @@ pub(crate) fn try_fwd(
 
                             // SAFETY: tail launch covers only RHS columns [main_b_size, b_size)
                             // using the same MMQ Q8_1 scratch layout and output allocation.
+                            let q4k_mmai_tail_host_start = std::time::Instant::now();
                             unsafe { op.async_on(&cutile_stream) }.map_err(cutile_err)?;
+                            q4k_mmai_tail_host_ms =
+                                Some(q4k_mmai_tail_host_start.elapsed().as_secs_f64() * 1000.0);
+                            let q4k_mmai_tail_end_event =
+                                record_timing_event(&stream, timing_enabled)?;
+                            q4k_mmai_tail_events =
+                                q4k_mmai_tail_start_event.zip(q4k_mmai_tail_end_event);
                         }
                     } else if use_mmq_q8_layout
                         && tiled_prefill_enabled()
@@ -2492,6 +2594,10 @@ pub(crate) fn try_fwd(
                                 out_ptr as cutile::cuda_core::sys::CUdeviceptr,
                             )
                         };
+                        trace_main_kernel = "q4k_q8_1_mmq_matmul_tiled_f32";
+                        trace_tail_kernel = "none";
+                        trace_main_b_size = b_size;
+                        trace_tail_b_size = 0;
                         let op = unsafe {
                             q4k_q8_1_mmq_matmul_tiled_kernel::q4k_q8_1_mmq_matmul_tiled_f32(
                                 qweight_cutile,
@@ -2525,6 +2631,10 @@ pub(crate) fn try_fwd(
                                 out_ptr as cutile::cuda_core::sys::CUdeviceptr,
                             )
                         };
+                        trace_main_kernel = "q4k_q8_1_mmq_matmul_batched_f32";
+                        trace_tail_kernel = "none";
+                        trace_main_b_size = b_size;
+                        trace_tail_b_size = 0;
                         let op = unsafe {
                             q4k_q8_1_mmq_matmul_batched_kernel::q4k_q8_1_mmq_matmul_batched_f32(
                                 qweight_cutile,
@@ -2557,6 +2667,10 @@ pub(crate) fn try_fwd(
                                 out_ptr as cutile::cuda_core::sys::CUdeviceptr,
                             )
                         };
+                        trace_main_kernel = "q4k_q8_1_matmul_batched_f32";
+                        trace_tail_kernel = "none";
+                        trace_main_b_size = b_size;
+                        trace_tail_b_size = 0;
                         let op = unsafe {
                             q4k_q8_1_matmul_batched_kernel::q4k_q8_1_matmul_batched_f32(
                                 qweight_cutile,
@@ -2577,6 +2691,10 @@ pub(crate) fn try_fwd(
                 }
                 GgmlDType::Q6K => {
                     if b_size == 1 {
+                        trace_main_kernel = "q6k_q8_1_matvec_b1_f32";
+                        trace_tail_kernel = "none";
+                        trace_main_b_size = b_size;
+                        trace_tail_b_size = 0;
                         let qweight_cutile = unsafe {
                             DevicePointer::<u8>::from_cu_deviceptr(
                                 qweight_ptr as cutile::cuda_core::sys::CUdeviceptr,
@@ -2622,6 +2740,11 @@ pub(crate) fn try_fwd(
                                 out_ptr as cutile::cuda_core::sys::CUdeviceptr,
                             )
                         };
+                        trace_main_kernel = "q6k_q8_1_mmq_matmul_batched_f32";
+                        trace_tail_kernel = "none";
+                        trace_main_b_size = b_size;
+                        trace_tail_b_size = 0;
+                        let q6k_mmq_start_event = record_timing_event(&stream, timing_enabled)?;
                         let op = unsafe {
                             q6k_q8_1_mmq_matmul_batched_kernel::q6k_q8_1_mmq_matmul_batched_f32(
                                 qweight_cutile,
@@ -2637,7 +2760,11 @@ pub(crate) fn try_fwd(
 
                         // SAFETY: same Candle-owned allocation and stream-ordering argument
                         // as the decode launch above, using Candle's MMQ Q8_1 scratch layout.
+                        let q6k_mmq_host_start = std::time::Instant::now();
                         unsafe { op.async_on(&cutile_stream) }.map_err(cutile_err)?;
+                        q6k_mmq_host_ms = Some(q6k_mmq_host_start.elapsed().as_secs_f64() * 1000.0);
+                        let q6k_mmq_end_event = record_timing_event(&stream, timing_enabled)?;
+                        q6k_mmq_events = q6k_mmq_start_event.zip(q6k_mmq_end_event);
                     } else {
                         let qweight_cutile = unsafe {
                             DevicePointer::<u8>::from_cu_deviceptr(
@@ -2654,6 +2781,10 @@ pub(crate) fn try_fwd(
                                 out_ptr as cutile::cuda_core::sys::CUdeviceptr,
                             )
                         };
+                        trace_main_kernel = "q6k_q8_1_matmul_batched_f32";
+                        trace_tail_kernel = "none";
+                        trace_main_b_size = b_size;
+                        trace_tail_b_size = 0;
                         let op = unsafe {
                             q6k_q8_1_matmul_batched_kernel::q6k_q8_1_matmul_batched_f32(
                                 qweight_cutile,
@@ -2676,9 +2807,42 @@ pub(crate) fn try_fwd(
             }
         }
 
+        total_end_event = record_timing_event(&stream, timing_enabled)?;
+
         drop(out_write);
         drop(qweight_read);
         drop(scratch_write);
+    }
+
+    if timing_enabled {
+        let total_gpu_events = total_start_event.zip(total_end_event);
+        let q8_quant_ms = elapsed_timing_ms(&q8_quant_events)?;
+        let q4k_mmai_main_ms = elapsed_timing_ms(&q4k_mmai_main_events)?;
+        let q4k_mmai_tail_ms = elapsed_timing_ms(&q4k_mmai_tail_events)?;
+        let q6k_mmq_ms = elapsed_timing_ms(&q6k_mmq_events)?;
+        let total_gpu_ms = elapsed_timing_ms(&total_gpu_events)?;
+        let total_host_ms = total_host_start.elapsed().as_secs_f64() * 1000.0;
+        trace_cutile_measurement(format_args!(
+            "cutile_timing dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} main_kernel={} tail_kernel={} main_b_size={} tail_b_size={} q8_quant_ms={} q4k_mmai_main_ms={} q4k_mmai_tail_ms={} q6k_mmq_ms={} total_gpu_ms={} q4k_mmai_main_host_submit_or_jit_ms={} q4k_mmai_tail_host_submit_or_jit_ms={} q6k_mmq_host_submit_or_jit_ms={} total_host_submit_or_jit_ms={:.3}",
+            w_dtype,
+            rhs.dtype(),
+            nrows,
+            ncols,
+            b_size,
+            trace_main_kernel,
+            trace_tail_kernel,
+            trace_main_b_size,
+            trace_tail_b_size,
+            fmt_timing_ms(q8_quant_ms),
+            fmt_timing_ms(q4k_mmai_main_ms),
+            fmt_timing_ms(q4k_mmai_tail_ms),
+            fmt_timing_ms(q6k_mmq_ms),
+            fmt_timing_ms(total_gpu_ms),
+            fmt_host_ms(q4k_mmai_main_host_ms),
+            fmt_host_ms(q4k_mmai_tail_host_ms),
+            fmt_host_ms(q6k_mmq_host_ms),
+            total_host_ms,
+        ));
     }
 
     let mut out_shape = rhs_l.shape().dims().to_vec();
@@ -3114,6 +3278,89 @@ mod tests {
             false,
             true,
         );
+    }
+
+    fn timed_forward_ms(matmul: &quantized::QMatMul, x: &Tensor, cuda: &CudaDevice) -> f64 {
+        let start = std::time::Instant::now();
+        let _ = matmul.forward(x).unwrap();
+        cuda.synchronize().unwrap();
+        start.elapsed().as_secs_f64() * 1000.0
+    }
+
+    #[test]
+    #[ignore = "requires CUDA 13.2+/cuTile runtime and a CUDA device"]
+    fn cutile_q4k_q8_1_benchmark_variants() {
+        let _env_guard = QUANT_KERNEL_ENV_LOCK.lock().unwrap();
+        let _kernel_guard = EnvVarGuard::save("PI_CANDLE_QUANT_KERNEL");
+        let _fallback_guard = EnvVarGuard::save("PI_CANDLE_QUANT_FALLBACK");
+        let _tiled_guard = EnvVarGuard::save("PI_CANDLE_QUANT_CUTILE_TILED");
+        let _mmai_guard = EnvVarGuard::save("PI_CANDLE_QUANT_CUTILE_MMAI");
+
+        std::thread::Builder::new()
+            .name("pi-ai-candle-worker".to_string())
+            .spawn(|| {
+                std::env::remove_var("PI_CANDLE_QUANT_FALLBACK");
+
+                let warm_iters = std::env::var("PI_CANDLE_QUANT_BENCH_ITERS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(3)
+                    .max(1);
+
+                let device = Device::new_cuda(0).unwrap();
+                let cuda = device.as_cuda_device().unwrap();
+                let nrows = 4096usize;
+                let ncols = 2560usize;
+                let b_size = 372usize;
+
+                let weights = (0..nrows * ncols)
+                    .map(|i| {
+                        let phase = (i % 257) as f32;
+                        (phase * 0.011).sin() * 3.0 + ((i / ncols) as f32 - 4.0) * 0.03
+                    })
+                    .collect::<Vec<_>>();
+                let x = (0..b_size * ncols)
+                    .map(|i| ((i % 131) as f32 * 0.017).cos() * 2.0 - 0.75)
+                    .collect::<Vec<_>>();
+
+                let weights = Tensor::from_slice(&weights, (nrows, ncols), &device).unwrap();
+                let x = Tensor::from_slice(&x, (1usize, b_size, ncols), &device).unwrap();
+                let qtensor = quantized::QTensor::quantize(&weights, GgmlDType::Q4K).unwrap();
+                let matmul = quantized::QMatMul::from_qtensor(qtensor).unwrap();
+
+                for (label, backend, tiled, mmai) in [
+                    ("candle-cuda", "candle", false, false),
+                    ("cutile-scalar", "cutile", false, false),
+                    ("cutile-tiled-4x4", "cutile", true, false),
+                    ("cutile-mmai-16x16", "cutile", false, true),
+                ] {
+                    std::env::set_var("PI_CANDLE_QUANT_KERNEL", backend);
+                    if tiled {
+                        std::env::set_var("PI_CANDLE_QUANT_CUTILE_TILED", "1");
+                    } else {
+                        std::env::remove_var("PI_CANDLE_QUANT_CUTILE_TILED");
+                    }
+                    if mmai {
+                        std::env::set_var("PI_CANDLE_QUANT_CUTILE_MMAI", "1");
+                    } else {
+                        std::env::remove_var("PI_CANDLE_QUANT_CUTILE_MMAI");
+                    }
+
+                    let cold_ms = timed_forward_ms(&matmul, &x, cuda);
+                    let mut warm_ms = Vec::with_capacity(warm_iters);
+                    for _ in 0..warm_iters {
+                        warm_ms.push(timed_forward_ms(&matmul, &x, cuda));
+                    }
+                    let warm_mean_ms = warm_ms.iter().sum::<f64>() / warm_ms.len() as f64;
+                    let warm_min_ms = warm_ms.iter().copied().fold(f64::INFINITY, f64::min);
+                    eprintln!(
+                        "candle quant-kernel benchmark variant={label} cold_ms={cold_ms:.3} warm_mean_ms={warm_mean_ms:.3} warm_min_ms={warm_min_ms:.3} warm_iters={warm_iters} nrows={nrows} ncols={ncols} b_size={b_size}"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

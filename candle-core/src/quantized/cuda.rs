@@ -109,6 +109,31 @@ fn cutile_kernel_name(dtype: GgmlDType, nrows: usize, b_size: usize) -> &'static
 }
 
 #[cfg(feature = "cuda-cutile")]
+fn cutile_kernel_plan_trace(dtype: GgmlDType, nrows: usize, b_size: usize) -> String {
+    let main_kernel = cutile_kernel_name(dtype, nrows, b_size);
+    if dtype == GgmlDType::Q4K
+        && b_size > 8
+        && cutile_mmai_prefill_enabled()
+        && nrows.is_multiple_of(16)
+        && b_size >= 16
+        && b_size.is_multiple_of(4)
+    {
+        let main_b_size = (b_size / 16) * 16;
+        let tail_b_size = b_size - main_b_size;
+        let tail_kernel = if tail_b_size != 0 {
+            "q4k_q8_1_mmq_matmul_tiled_f32"
+        } else {
+            "none"
+        };
+        format!(
+            "main_kernel={main_kernel} tail_kernel={tail_kernel} main_b_size={main_b_size} tail_b_size={tail_b_size}"
+        )
+    } else {
+        format!("main_kernel={main_kernel} tail_kernel=none main_b_size={b_size} tail_b_size=0")
+    }
+}
+
+#[cfg(feature = "cuda-cutile")]
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -973,6 +998,8 @@ impl QCudaStorage {
                     _ => 0,
                 };
                 let trace_kernel = cutile_kernel_name(self.dtype, trace_nrows, trace_b_size);
+                let trace_kernel_plan =
+                    cutile_kernel_plan_trace(self.dtype, trace_nrows, trace_b_size);
                 if !cuda_toolkit_path_is_set() {
                     if !quant_kernel_fallback_to_candle_enabled() {
                         crate::bail!(
@@ -998,8 +1025,9 @@ impl QCudaStorage {
                     match cutile_result {
                         Ok(Ok(Some(result))) => {
                             trace_quant_kernel(format_args!(
-                            "selected_backend=cutile actual_backend=cutile kernel={} fallback_reason=none dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
+                            "selected_backend=cutile actual_backend=cutile kernel={} {} fallback_reason=none dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} cuda_toolkit_path={} weight_shape={:?} rhs_shape={:?}",
                             trace_kernel,
+                            trace_kernel_plan,
                             self.dtype,
                             storage.dtype(),
                             trace_nrows,
