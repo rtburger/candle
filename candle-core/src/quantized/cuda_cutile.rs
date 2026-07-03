@@ -62,6 +62,15 @@ fn q6k_b1_rows4_enabled() -> bool {
     )
 }
 
+fn q6k_b1_rows8_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS8")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
 fn cutile_trace_enabled() -> bool {
     matches!(
         std::env::var("PI_CANDLE_QUANT_TRACE").ok().as_deref(),
@@ -2452,6 +2461,215 @@ mod q6k_q8_1_matvec_rows4_kernel {
 }
 
 #[cutile::module]
+mod q6k_q8_1_matvec_rows8_kernel {
+    use cutile::core::*;
+
+    #[cutile::entry()]
+    pub unsafe fn q6k_q8_1_matvec_b1_rows8_f32(
+        q6_ptr: *mut u8,
+        q8_ptr: *mut u8,
+        out_ptr: *mut f32,
+        ncols: i32,
+        nrows: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let row_base: i32 = pid.0 * 8i32;
+        if row_base + 7i32 >= nrows {
+            return;
+        }
+
+        let q6_base: PointerTile<*mut u8, { [] }> = pointer_to_tile(q6_ptr);
+        let q6_half_base: PointerTile<*mut f16, { [] }> = ptr_to_ptr(q6_base);
+        let q6_i8_base: PointerTile<*mut i8, { [] }> = ptr_to_ptr(q6_base);
+        let q6_half_1: PointerTile<*mut f16, { [1] }> = q6_half_base.reshape(const_shape![1]);
+        let q6_i8_1: PointerTile<*mut i8, { [1] }> = q6_i8_base.reshape(const_shape![1]);
+        let q8_base: PointerTile<*mut u8, { [] }> = pointer_to_tile(q8_ptr);
+        let q8_half_base: PointerTile<*mut f16, { [] }> = ptr_to_ptr(q8_base);
+        let q8_i8_base: PointerTile<*mut i8, { [] }> = ptr_to_ptr(q8_base);
+        let q8_half_1: PointerTile<*mut f16, { [1] }> = q8_half_base.reshape(const_shape![1]);
+        let q8_i8_1: PointerTile<*mut i8, { [1] }> = q8_i8_base.reshape(const_shape![1]);
+
+        let row_lanes8: Tile<i32, { [8] }> = iota(const_shape![8]);
+        let q_lanes4: Tile<i32, { [4] }> = iota(const_shape![4]);
+        let q_lanes32: Tile<i32, { [32] }> = iota(const_shape![32]);
+        let c3_32: Tile<i32, { [32] }> = constant(3i32, const_shape![32]);
+        let c4_32: Tile<i32, { [32] }> = constant(4i32, const_shape![32]);
+        let c15_32: Tile<i32, { [32] }> = constant(15i32, const_shape![32]);
+        let c32_32: Tile<i32, { [32] }> = constant(32i32, const_shape![32]);
+        let c255_32: Tile<i32, { [32] }> = constant(255i32, const_shape![32]);
+        let lane_lanes32: Tile<i32, { [32] }> = q_lanes32 - (q_lanes32 / c4_32) * c4_32;
+
+        let mut acc8: Tile<f32, { [8] }> = constant(0.0f32, const_shape![8]);
+        let blocks_per_row: i32 = ncols / 256i32;
+        let rows8: Tile<i32, { [8] }> = row_lanes8 + broadcast_scalar(row_base, const_shape![8]);
+        let q6_row_bases8: Tile<i32, { [8] }> =
+            rows8 * broadcast_scalar(blocks_per_row * 210i32, const_shape![8]);
+
+        for block in 0i32..blocks_per_row {
+            let q6_block_bases8: Tile<i32, { [8] }> =
+                q6_row_bases8 + broadcast_scalar(block * 210i32, const_shape![8]);
+            let q6_block_bases32: Tile<i32, { [32] }> = q6_block_bases8
+                .reshape(const_shape![8, 1])
+                .broadcast(const_shape![8, 4])
+                .reshape(const_shape![32]);
+
+            let d_offsets8: Tile<i32, { [8] }> = (q6_block_bases8
+                + constant(208i32, const_shape![8]))
+                / constant(2i32, const_shape![8]);
+            let q6_half_8: PointerTile<*mut f16, { [8] }> = q6_half_1.broadcast(const_shape![8]);
+            let d_ptrs: PointerTile<*mut f16, { [8] }> = q6_half_8.offset_tile(d_offsets8);
+            let (d_h8, _d_tok): (Tile<f16, { [8] }>, Token) = load_ptr_tko(
+                d_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                None,
+                Latency::<0>,
+            );
+            let d8_rows: Tile<f32, { [8] }> = ftof(d_h8, rounding::NearestEven);
+            let d32: Tile<f32, { [32] }> = d8_rows
+                .reshape(const_shape![8, 1])
+                .broadcast(const_shape![8, 4])
+                .reshape(const_shape![32]);
+
+            for iqs in 0i32..32i32 {
+                let bq8_offset: i32 = 4i32 * (iqs / 16i32) + (iqs % 16i32) / 8i32;
+                let scale_offset: i32 = 8i32 * (iqs / 16i32) + (iqs % 16i32) / 4i32;
+                let vh_shift: i32 = 2i32 * ((iqs % 16i32) / 8i32);
+
+                let ql_offsets32: Tile<i32, { [32] }> = q6_block_bases32
+                    + lane_lanes32
+                    + broadcast_scalar(4i32 * iqs, const_shape![32]);
+                let q6_i8_32: PointerTile<*mut i8, { [32] }> = q6_i8_1.broadcast(const_shape![32]);
+                let ql_ptrs: PointerTile<*mut i8, { [32] }> = q6_i8_32.offset_tile(ql_offsets32);
+                let (ql_bytes, _ql_tok): (Tile<i8, { [32] }>, Token) = load_ptr_tko(
+                    ql_ptrs,
+                    ordering::Weak,
+                    None::<scope::TileBlock>,
+                    None,
+                    Some(0i8),
+                    None,
+                    Latency::<0>,
+                );
+                let ql_i32: Tile<i32, { [32] }> = exti(ql_bytes) & c255_32;
+
+                let qh_index: i32 = 8i32 * (iqs / 16i32) + iqs % 8i32;
+                let qh_offsets32: Tile<i32, { [32] }> = q6_block_bases32
+                    + lane_lanes32
+                    + broadcast_scalar(128i32 + 4i32 * qh_index, const_shape![32]);
+                let qh_ptrs: PointerTile<*mut i8, { [32] }> = q6_i8_32.offset_tile(qh_offsets32);
+                let (qh_bytes, _qh_tok): (Tile<i8, { [32] }>, Token) = load_ptr_tko(
+                    qh_ptrs,
+                    ordering::Weak,
+                    None::<scope::TileBlock>,
+                    None,
+                    Some(0i8),
+                    None,
+                    Latency::<0>,
+                );
+                let qh_i32: Tile<i32, { [32] }> = exti(qh_bytes) & c255_32;
+
+                for half in 0i32..2i32 {
+                    let ql_shift: Tile<i32, { [32] }> =
+                        broadcast_scalar(4i32 * half, const_shape![32]);
+                    let qh_shift: Tile<i32, { [32] }> =
+                        broadcast_scalar(vh_shift + 4i32 * half, const_shape![32]);
+                    let ql_part: Tile<i32, { [32] }> = shri(ql_i32, ql_shift) & c15_32;
+                    let qh_part: Tile<i32, { [32] }> = shri(qh_i32, qh_shift) & c3_32;
+                    let q6_i32: Tile<i32, { [32] }> =
+                        (ql_part | shli(qh_part, c4_32, overflow::NoWrap)) - c32_32;
+                    let q6_f32: Tile<f32, { [32] }> = convert_tile(q6_i32);
+
+                    let scale_index: i32 = scale_offset + 4i32 * half;
+                    let scale_offsets8: Tile<i32, { [8] }> =
+                        q6_block_bases8 + broadcast_scalar(192i32 + scale_index, const_shape![8]);
+                    let q6_i8_8: PointerTile<*mut i8, { [8] }> = q6_i8_1.broadcast(const_shape![8]);
+                    let scale_ptrs: PointerTile<*mut i8, { [8] }> =
+                        q6_i8_8.offset_tile(scale_offsets8);
+                    let (scale_i8, _scale_tok): (Tile<i8, { [8] }>, Token) = load_ptr_tko(
+                        scale_ptrs,
+                        ordering::Weak,
+                        None::<scope::TileBlock>,
+                        None,
+                        None,
+                        None,
+                        Latency::<0>,
+                    );
+                    let scale_i32: Tile<i32, { [8] }> = exti(scale_i8);
+                    let scale_f32: Tile<f32, { [8] }> = convert_tile(scale_i32);
+                    let scale32: Tile<f32, { [32] }> = scale_f32
+                        .reshape(const_shape![8, 1])
+                        .broadcast(const_shape![8, 4])
+                        .reshape(const_shape![32]);
+
+                    let q8_block_index: i32 = block * 8i32 + bq8_offset + 2i32 * half;
+                    let q8_block_base: i32 = q8_block_index * 36i32;
+                    let d8_offset: Tile<i32, { [1] }> =
+                        broadcast_scalar(q8_block_base / 2i32, const_shape![1]);
+                    let d8_ptr: PointerTile<*mut f16, { [1] }> = q8_half_1.offset_tile(d8_offset);
+                    let (d8_h_1, _d8_tok): (Tile<f16, { [1] }>, Token) = load_ptr_tko(
+                        d8_ptr,
+                        ordering::Weak,
+                        None::<scope::TileBlock>,
+                        None,
+                        None,
+                        None,
+                        Latency::<0>,
+                    );
+                    let d8_1: Tile<f32, { [1] }> = ftof(d8_h_1, rounding::NearestEven);
+                    let d8_32: Tile<f32, { [32] }> = d8_1.broadcast(const_shape![32]);
+
+                    let q8_offsets4: Tile<i32, { [4] }> = q_lanes4
+                        + broadcast_scalar(
+                            q8_block_base + 4i32 + 4i32 * (iqs % 8i32),
+                            const_shape![4],
+                        );
+                    let q8_i8_4: PointerTile<*mut i8, { [4] }> = q8_i8_1.broadcast(const_shape![4]);
+                    let q8_ptrs: PointerTile<*mut i8, { [4] }> = q8_i8_4.offset_tile(q8_offsets4);
+                    let (q8_bytes, _q8_tok): (Tile<i8, { [4] }>, Token) = load_ptr_tko(
+                        q8_ptrs,
+                        ordering::Weak,
+                        None::<scope::TileBlock>,
+                        None,
+                        Some(0i8),
+                        None,
+                        Latency::<0>,
+                    );
+                    let q8_i32: Tile<i32, { [4] }> = exti(q8_bytes);
+                    let q8_f32: Tile<f32, { [4] }> = convert_tile(q8_i32);
+                    let q8_32: Tile<f32, { [32] }> = q8_f32
+                        .reshape(const_shape![1, 4])
+                        .broadcast(const_shape![8, 4])
+                        .reshape(const_shape![32]);
+
+                    let prod32: Tile<f32, { [32] }> = d32 * scale32 * q6_f32 * d8_32 * q8_32;
+                    let prod84: Tile<f32, { [8, 4] }> = prod32.reshape(const_shape![8, 4]);
+                    let partial8: Tile<f32, { [8] }> = reduce_sum(prod84, 1i32);
+                    acc8 = acc8 + partial8;
+                }
+            }
+        }
+
+        let out_base: PointerTile<*mut f32, { [] }> = pointer_to_tile(out_ptr);
+        let out_1: PointerTile<*mut f32, { [1] }> = out_base.reshape(const_shape![1]);
+        let out_8: PointerTile<*mut f32, { [8] }> = out_1.broadcast(const_shape![8]);
+        let out_offsets: Tile<i32, { [8] }> =
+            row_lanes8 + broadcast_scalar(row_base, const_shape![8]);
+        let out_dst: PointerTile<*mut f32, { [8] }> = out_8.offset_tile(out_offsets);
+        store_ptr_tko(
+            out_dst,
+            acc8,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            Latency::<0>,
+        );
+    }
+}
+
+#[cutile::module]
 mod q6k_q8_1_matmul_batched_kernel {
     use cutile::core::*;
 
@@ -2970,6 +3188,7 @@ pub(crate) fn try_fwd(
     let mut q4k_matvec_b1_rows4_events = None;
     let mut q6k_mmq_events = None;
     let mut q6k_matvec_b1_rows4_events = None;
+    let mut q6k_matvec_b1_rows8_events = None;
     let mut q4k_mmai_main_host_ms = None;
     let mut q4k_mmai_tail_host_ms = None;
     let mut q4k_scalar_mmq_host_ms = None;
@@ -2977,6 +3196,7 @@ pub(crate) fn try_fwd(
     let mut q4k_matvec_b1_rows4_host_ms = None;
     let mut q6k_mmq_host_ms = None;
     let mut q6k_matvec_b1_rows4_host_ms = None;
+    let mut q6k_matvec_b1_rows8_host_ms = None;
     let trace_main_kernel: &'static str;
     let trace_tail_kernel: &'static str;
     let trace_main_b_size: usize;
@@ -3340,7 +3560,32 @@ pub(crate) fn try_fwd(
                                 out_ptr as cutile::cuda_core::sys::CUdeviceptr,
                             )
                         };
-                        if q6k_b1_rows4_enabled() && nrows.is_multiple_of(4) {
+                        if q6k_b1_rows8_enabled() && nrows.is_multiple_of(8) {
+                            trace_main_kernel = "q6k_q8_1_matvec_b1_rows8_f32";
+                            let q6k_rows8_start_event =
+                                record_timing_event(&stream, timing_enabled)?;
+                            let op = unsafe {
+                                q6k_q8_1_matvec_rows8_kernel::q6k_q8_1_matvec_b1_rows8_f32(
+                                    qweight_cutile,
+                                    q8_cutile,
+                                    out_cutile,
+                                    ncols as i32,
+                                    nrows as i32,
+                                )
+                            }
+                            .grid(((nrows / 8) as u32, 1, 1));
+
+                            // SAFETY: each cuTile program owns eight contiguous output rows.
+                            // The Q6K weights and Q8 scratch are read-only and all work is
+                            // enqueued on Candle's stream after Q8 quantization.
+                            let q6k_rows8_host_start = std::time::Instant::now();
+                            unsafe { op.async_on(&cutile_stream) }.map_err(cutile_err)?;
+                            q6k_matvec_b1_rows8_host_ms =
+                                Some(q6k_rows8_host_start.elapsed().as_secs_f64() * 1000.0);
+                            let q6k_rows8_end_event = record_timing_event(&stream, timing_enabled)?;
+                            q6k_matvec_b1_rows8_events =
+                                q6k_rows8_start_event.zip(q6k_rows8_end_event);
+                        } else if q6k_b1_rows4_enabled() && nrows.is_multiple_of(4) {
                             trace_main_kernel = "q6k_q8_1_matvec_b1_rows4_f32";
                             let q6k_rows4_start_event =
                                 record_timing_event(&stream, timing_enabled)?;
@@ -3482,9 +3727,11 @@ pub(crate) fn try_fwd(
         let q4k_matvec_b1_rows4_ms = elapsed_timing_ms(&q4k_matvec_b1_rows4_events)?;
         let q6k_mmq_ms = elapsed_timing_ms(&q6k_mmq_events)?;
         let q6k_matvec_b1_rows4_ms = elapsed_timing_ms(&q6k_matvec_b1_rows4_events)?;
+        let q6k_matvec_b1_rows8_ms = elapsed_timing_ms(&q6k_matvec_b1_rows8_events)?;
         let total_gpu_ms = elapsed_timing_ms(&total_gpu_events)?;
         let decode_matvec_gpu_ms = if b_size == 1 {
             q4k_matvec_b1_rows4_ms
+                .or(q6k_matvec_b1_rows8_ms)
                 .or(q6k_matvec_b1_rows4_ms)
                 .or(total_gpu_ms)
         } else {
@@ -3503,7 +3750,7 @@ pub(crate) fn try_fwd(
         let estimated_bandwidth_gbps = estimated_gbps(estimated_weight_bytes, decode_matvec_gpu_ms);
         let total_host_ms = total_host_start.elapsed().as_secs_f64() * 1000.0;
         trace_cutile_measurement(format_args!(
-            "cutile_timing dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} main_kernel={} tail_kernel={} main_b_size={} tail_b_size={} q8_quant_ms={} q4k_mmai_main_ms={} q4k_mmai_tail_ms={} q4k_scalar_mmq_ms={} q4k_tiled_mmq_ms={} q4k_matvec_b1_rows4_ms={} q6k_mmq_ms={} q6k_matvec_b1_rows4_ms={} total_gpu_ms={} decode_matvec_kernel={} decode_matvec_gpu_ms={} estimated_weight_bytes={} estimated_gbps={} q4k_mmai_main_host_submit_or_jit_ms={} q4k_mmai_tail_host_submit_or_jit_ms={} q4k_scalar_mmq_host_submit_or_jit_ms={} q4k_tiled_mmq_host_submit_or_jit_ms={} q4k_matvec_b1_rows4_host_submit_or_jit_ms={} q6k_mmq_host_submit_or_jit_ms={} q6k_matvec_b1_rows4_host_submit_or_jit_ms={} total_host_submit_or_jit_ms={:.3}",
+            "cutile_timing dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} main_kernel={} tail_kernel={} main_b_size={} tail_b_size={} q8_quant_ms={} q4k_mmai_main_ms={} q4k_mmai_tail_ms={} q4k_scalar_mmq_ms={} q4k_tiled_mmq_ms={} q4k_matvec_b1_rows4_ms={} q6k_mmq_ms={} q6k_matvec_b1_rows4_ms={} q6k_matvec_b1_rows8_ms={} total_gpu_ms={} decode_matvec_kernel={} decode_matvec_gpu_ms={} estimated_weight_bytes={} estimated_gbps={} q4k_mmai_main_host_submit_or_jit_ms={} q4k_mmai_tail_host_submit_or_jit_ms={} q4k_scalar_mmq_host_submit_or_jit_ms={} q4k_tiled_mmq_host_submit_or_jit_ms={} q4k_matvec_b1_rows4_host_submit_or_jit_ms={} q6k_mmq_host_submit_or_jit_ms={} q6k_matvec_b1_rows4_host_submit_or_jit_ms={} q6k_matvec_b1_rows8_host_submit_or_jit_ms={} total_host_submit_or_jit_ms={:.3}",
             w_dtype,
             rhs.dtype(),
             nrows,
@@ -3521,6 +3768,7 @@ pub(crate) fn try_fwd(
             fmt_timing_ms(q4k_matvec_b1_rows4_ms),
             fmt_timing_ms(q6k_mmq_ms),
             fmt_timing_ms(q6k_matvec_b1_rows4_ms),
+            fmt_timing_ms(q6k_matvec_b1_rows8_ms),
             fmt_timing_ms(total_gpu_ms),
             decode_matvec_kernel,
             fmt_timing_ms(decode_matvec_gpu_ms),
@@ -3533,6 +3781,7 @@ pub(crate) fn try_fwd(
             fmt_host_ms(q4k_matvec_b1_rows4_host_ms),
             fmt_host_ms(q6k_mmq_host_ms),
             fmt_host_ms(q6k_matvec_b1_rows4_host_ms),
+            fmt_host_ms(q6k_matvec_b1_rows8_host_ms),
             total_host_ms,
         ));
     }
@@ -3708,10 +3957,15 @@ mod tests {
         }
     }
 
-    fn run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(dtype: GgmlDType, rows4: bool) {
+    fn run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(
+        dtype: GgmlDType,
+        rows4: bool,
+        rows8: bool,
+    ) {
         let _env_guard = QUANT_KERNEL_ENV_LOCK.lock().unwrap();
         let _q4k_rows4_guard = EnvVarGuard::save("PI_CANDLE_QUANT_CUTILE_Q4K_B1_ROWS4");
         let _q6k_rows4_guard = EnvVarGuard::save("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS4");
+        let _q6k_rows8_guard = EnvVarGuard::save("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS8");
         std::thread::Builder::new()
             .name("pi-ai-candle-worker".to_string())
             .spawn(move || {
@@ -3719,6 +3973,7 @@ mod tests {
                 std::env::remove_var("PI_CANDLE_QUANT_FALLBACK");
                 std::env::remove_var("PI_CANDLE_QUANT_CUTILE_Q4K_B1_ROWS4");
                 std::env::remove_var("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS4");
+                std::env::remove_var("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS8");
                 if rows4 {
                     match dtype {
                         GgmlDType::Q4K => {
@@ -3729,6 +3984,9 @@ mod tests {
                         }
                         _ => {}
                     }
+                }
+                if rows8 && dtype == GgmlDType::Q6K {
+                    std::env::set_var("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS8", "1");
                 }
 
                 let device = Device::new_cuda(0).unwrap();
@@ -3932,13 +4190,13 @@ mod tests {
     #[test]
     #[ignore = "requires CUDA 13.2+/cuTile runtime and a CUDA device"]
     fn cutile_q4k_q8_1_b1_matches_candle_cuda_matvec() {
-        run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q4K, false);
+        run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q4K, false, false);
     }
 
     #[test]
     #[ignore = "requires CUDA 13.2+/cuTile runtime and a CUDA device"]
     fn cutile_q4k_q8_1_b1_rows4_matches_candle_cuda_matvec() {
-        run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q4K, true);
+        run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q4K, true, false);
     }
 
     #[test]
@@ -4092,12 +4350,18 @@ mod tests {
     #[test]
     #[ignore = "requires CUDA 13.2+/cuTile runtime and a CUDA device"]
     fn cutile_q6k_q8_1_b1_matches_candle_cuda_matvec() {
-        run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q6K, false);
+        run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q6K, false, false);
     }
 
     #[test]
     #[ignore = "requires CUDA 13.2+/cuTile runtime and a CUDA device"]
     fn cutile_q6k_q8_1_b1_rows4_matches_candle_cuda_matvec() {
-        run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q6K, true);
+        run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q6K, true, false);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA 13.2+/cuTile runtime and a CUDA device"]
+    fn cutile_q6k_q8_1_b1_rows8_matches_candle_cuda_matvec() {
+        run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q6K, false, true);
     }
 }
