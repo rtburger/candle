@@ -122,6 +122,16 @@ impl QMatMul {
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         Ok(Self { inner, span })
     }
+
+    pub fn row_concat(weights: &[&Self]) -> Result<Self> {
+        let inner_weights = weights
+            .iter()
+            .map(|weight| &weight.inner)
+            .collect::<Vec<_>>();
+        let inner = candle::quantized::QMatMul::row_concat(&inner_weights)?;
+        let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
+        Ok(Self { inner, span })
+    }
 }
 
 impl Module for QMatMul {

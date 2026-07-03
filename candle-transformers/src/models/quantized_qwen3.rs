@@ -55,6 +55,35 @@ fn rope_kv_trace_enabled() -> bool {
     )
 }
 
+fn qwen3_projection_merge_trace_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_TRACE").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn trace_qwen3_projection_merge(message: impl std::fmt::Display) {
+    if qwen3_projection_merge_trace_enabled() {
+        eprintln!("candle quant-kernel qwen3_projection_merge {message}");
+    }
+}
+
+fn qwen3_merged_qkv_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QWEN3_MERGED_QKV").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn qwen3_merged_gate_up_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QWEN3_MERGED_GATE_UP")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
 #[cfg(feature = "cuda")]
 fn record_rope_kv_event(
     device: &Device,
@@ -135,6 +164,7 @@ fn trace_rope_kv_timed<T>(
 struct MlpWeights {
     gate_proj: QMatMul,
     up_proj: QMatMul,
+    gate_up_proj: Option<QMatMul>,
     down_proj: QMatMul,
     act_fn: Activation,
     span: tracing::Span,
@@ -144,12 +174,26 @@ impl MlpWeights {
     fn new<R: Read + Seek>(gg: &mut Gguf<R>, prefix: &str) -> Result<Self> {
         let gate_proj = gg.qmatmul(&format!("{prefix}.ffn_gate.weight"))?;
         let up_proj = gg.qmatmul(&format!("{prefix}.ffn_up.weight"))?;
+        let gate_up_proj = if qwen3_merged_gate_up_enabled() {
+            match QMatMul::row_concat(&[&gate_proj, &up_proj]) {
+                Ok(proj) => Some(proj),
+                Err(err) => {
+                    trace_qwen3_projection_merge(format_args!(
+                        "kind=gate_up prefix={prefix} status=fallback reason={err}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let down_proj = gg.qmatmul(&format!("{prefix}.ffn_down.weight"))?;
         let act_fn = Activation::Silu;
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
         Ok(Self {
             gate_proj,
             up_proj,
+            gate_up_proj,
             down_proj,
             act_fn,
             span,
@@ -160,9 +204,23 @@ impl MlpWeights {
 impl Module for MlpWeights {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let gate = self.gate_proj.forward(x)?.apply(&self.act_fn)?;
-        let up = self.up_proj.forward(x)?;
-        let gated = (gate * up)?;
+        let gated = if let Some(gate_up_proj) = &self.gate_up_proj {
+            let gate_up = gate_up_proj.forward(x)?;
+            let dims = gate_up.dims();
+            let last_dim_index = dims.len() - 1;
+            let last_dim = dims[last_dim_index];
+            let gate_rows = last_dim / 2;
+            let up_rows = last_dim - gate_rows;
+            let gate = gate_up
+                .narrow(last_dim_index, 0, gate_rows)?
+                .apply(&self.act_fn)?;
+            let up = gate_up.narrow(last_dim_index, gate_rows, up_rows)?;
+            (gate * up)?
+        } else {
+            let gate = self.gate_proj.forward(x)?.apply(&self.act_fn)?;
+            let up = self.up_proj.forward(x)?;
+            (gate * up)?
+        };
         self.down_proj.forward(&gated)
     }
 }
@@ -240,6 +298,7 @@ struct AttentionWeights {
     q_proj: QMatMul,
     k_proj: QMatMul,
     v_proj: QMatMul,
+    qkv_proj: Option<QMatMul>,
     o_proj: QMatMul,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -273,6 +332,19 @@ impl AttentionWeights {
         let q_proj = gg.qmatmul(&format!("{prefix}.attn_q.weight"))?;
         let k_proj = gg.qmatmul(&format!("{prefix}.attn_k.weight"))?;
         let v_proj = gg.qmatmul(&format!("{prefix}.attn_v.weight"))?;
+        let qkv_proj = if qwen3_merged_qkv_enabled() {
+            match QMatMul::row_concat(&[&q_proj, &k_proj, &v_proj]) {
+                Ok(proj) => Some(proj),
+                Err(err) => {
+                    trace_qwen3_projection_merge(format_args!(
+                        "kind=qkv prefix={prefix} status=fallback reason={err}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let o_proj = gg.qmatmul(&format!("{prefix}.attn_output.weight"))?;
 
         let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?;
@@ -303,6 +375,7 @@ impl AttentionWeights {
             q_proj,
             k_proj,
             v_proj,
+            qkv_proj,
             o_proj,
             q_norm,
             k_norm,
@@ -324,9 +397,23 @@ impl AttentionWeights {
         let (b, l, _) = x.dims3()?;
 
         // QKV projections
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let (q, k, v) = if let Some(qkv_proj) = &self.qkv_proj {
+            let qkv = qkv_proj.forward(x)?;
+            let last_dim_index = qkv.dims().len() - 1;
+            let q_rows = self.num_heads * self.head_dim;
+            let k_rows = self.num_kv_heads * self.head_dim;
+            let v_rows = self.num_kv_heads * self.head_dim;
+            let q = qkv.narrow(last_dim_index, 0, q_rows)?;
+            let k = qkv.narrow(last_dim_index, q_rows, k_rows)?;
+            let v = qkv.narrow(last_dim_index, q_rows + k_rows, v_rows)?;
+            (q, k, v)
+        } else {
+            (
+                self.q_proj.forward(x)?,
+                self.k_proj.forward(x)?,
+                self.v_proj.forward(x)?,
+            )
+        };
 
         let q = q
             .reshape((b, l, self.num_heads, self.head_dim))?

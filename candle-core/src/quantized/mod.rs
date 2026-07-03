@@ -753,6 +753,64 @@ impl QTensor {
         self.storage.size_in_bytes()
     }
 
+    pub fn row_concat(tensors: &[&QTensor]) -> Result<Self> {
+        let Some(first) = tensors.first() else {
+            crate::bail!("cannot row-concat an empty quantized tensor list")
+        };
+        let dtype = first.dtype();
+        let device = first.device();
+        let (_, ncols) = first.shape.dims2()?;
+        if !ncols.is_multiple_of(dtype.block_size()) {
+            crate::bail!(
+                "quantized row-concat ncols {ncols} is not divisible by block size {}",
+                dtype.block_size()
+            )
+        }
+
+        let row_bytes = (ncols / dtype.block_size()) * dtype.type_size();
+        let mut total_rows = 0usize;
+        let mut total_bytes = 0usize;
+        for (index, tensor) in tensors.iter().enumerate() {
+            let (rows, cols) = tensor.shape.dims2()?;
+            if tensor.dtype() != dtype {
+                crate::bail!(
+                    "quantized row-concat dtype mismatch at input {index}: {:?} != {:?}",
+                    tensor.dtype(),
+                    dtype
+                )
+            }
+            if cols != ncols {
+                crate::bail!(
+                    "quantized row-concat ncols mismatch at input {index}: {cols} != {ncols}"
+                )
+            }
+            let tensor_device = tensor.device();
+            if !device.same_device(&tensor_device) {
+                crate::bail!(
+                    "quantized row-concat device mismatch at input {index}: {:?} != {:?}",
+                    tensor_device.location(),
+                    device.location()
+                )
+            }
+            let expected_bytes = rows * row_bytes;
+            let actual_bytes = tensor.storage_size_in_bytes();
+            if actual_bytes != expected_bytes {
+                crate::bail!(
+                    "quantized row-concat input {index} is not byte-compatible for exact row-major concat: storage_bytes={actual_bytes} expected_bytes={expected_bytes} rows={rows} ncols={ncols} dtype={dtype:?}"
+                )
+            }
+            total_rows += rows;
+            total_bytes += actual_bytes;
+        }
+
+        let mut data = Vec::with_capacity(total_bytes);
+        for tensor in tensors {
+            data.extend_from_slice(tensor.data()?.as_ref());
+        }
+        let storage = QStorage::from_data(Cow::Owned(data), &device, dtype)?;
+        QTensor::new(storage, (total_rows, ncols))
+    }
+
     pub fn data(&self) -> Result<Cow<'_, [u8]>> {
         self.storage.data()
     }
@@ -855,6 +913,21 @@ impl QMatMul {
 
     pub fn from_qtensor(qtensor: QTensor) -> Result<Self> {
         Self::from_arc(std::sync::Arc::new(qtensor))
+    }
+
+    pub fn row_concat(weights: &[&Self]) -> Result<Self> {
+        let mut tensors = Vec::with_capacity(weights.len());
+        for (index, weight) in weights.iter().enumerate() {
+            match weight {
+                Self::QTensor(qtensor) => tensors.push(qtensor.as_ref()),
+                Self::Tensor(_) | Self::TensorF16(_) => {
+                    crate::bail!(
+                        "quantized QMatMul row-concat input {index} is not backed by a QTensor"
+                    )
+                }
+            }
+        }
+        Self::from_qtensor(QTensor::row_concat(&tensors)?)
     }
 
     pub fn dequantize_f16(&self) -> Result<Tensor> {
