@@ -44,6 +44,15 @@ fn mmai_prefill_enabled() -> bool {
     )
 }
 
+fn q4k_b1_rows4_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QUANT_CUTILE_Q4K_B1_ROWS4")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
 fn q6k_b1_rows4_enabled() -> bool {
     matches!(
         std::env::var("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS4")
@@ -104,6 +113,41 @@ fn fmt_host_ms(value: Option<f64>) -> String {
         Some(value) => format!("{value:.3}"),
         None => "n/a".to_string(),
     }
+}
+
+fn fmt_usize(value: Option<usize>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "n/a".to_string(),
+    }
+}
+
+fn fmt_gbps(value: Option<f32>) -> String {
+    match value {
+        Some(value) => format!("{value:.2}"),
+        None => "n/a".to_string(),
+    }
+}
+
+fn estimated_decode_weight_bytes(dtype: GgmlDType, nrows: usize, ncols: usize) -> Option<usize> {
+    if !ncols.is_multiple_of(QK_K) {
+        return None;
+    }
+    let block_bytes = match dtype {
+        GgmlDType::Q4K => 144usize,
+        GgmlDType::Q6K => 210usize,
+        _ => return None,
+    };
+    Some(nrows * (ncols / QK_K) * block_bytes)
+}
+
+fn estimated_gbps(bytes: Option<usize>, gpu_ms: Option<f32>) -> Option<f32> {
+    let bytes = bytes?;
+    let gpu_ms = gpu_ms?;
+    if gpu_ms <= 0.0 {
+        return None;
+    }
+    Some(bytes as f32 / (gpu_ms / 1_000.0) / 1.0e9)
 }
 
 struct Q8ScratchWorkspaceSlot {
@@ -415,6 +459,269 @@ mod q4k_q8_1_matvec_kernel {
         store_ptr_tko(
             out_dst,
             acc.reshape(const_shape![1]),
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            Latency::<0>,
+        );
+    }
+}
+
+#[cutile::module]
+mod q4k_q8_1_matvec_rows4_kernel {
+    use cutile::core::*;
+
+    #[cutile::entry()]
+    pub unsafe fn q4k_q8_1_matvec_b1_rows4_f32(
+        q4_ptr: *mut u8,
+        q8_ptr: *mut u8,
+        out_ptr: *mut f32,
+        ncols: i32,
+        nrows: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let row_base: i32 = pid.0 * 4i32;
+        if row_base + 3i32 >= nrows {
+            return;
+        }
+
+        let q4_base: PointerTile<*mut u8, { [] }> = pointer_to_tile(q4_ptr);
+        let q4_half_base: PointerTile<*mut f16, { [] }> = ptr_to_ptr(q4_base);
+        let q4_i8_base: PointerTile<*mut i8, { [] }> = ptr_to_ptr(q4_base);
+        let q4_half_1: PointerTile<*mut f16, { [1] }> = q4_half_base.reshape(const_shape![1]);
+        let q4_i8_1: PointerTile<*mut i8, { [1] }> = q4_i8_base.reshape(const_shape![1]);
+        let q8_base: PointerTile<*mut u8, { [] }> = pointer_to_tile(q8_ptr);
+        let q8_half_base: PointerTile<*mut f16, { [] }> = ptr_to_ptr(q8_base);
+        let q8_i8_base: PointerTile<*mut i8, { [] }> = ptr_to_ptr(q8_base);
+        let q8_half_1: PointerTile<*mut f16, { [1] }> = q8_half_base.reshape(const_shape![1]);
+        let q8_i8_1: PointerTile<*mut i8, { [1] }> = q8_i8_base.reshape(const_shape![1]);
+
+        let row_lanes4: Tile<i32, { [4] }> = iota(const_shape![4]);
+        let col_lanes32: Tile<i32, { [32] }> = iota(const_shape![32]);
+        let col_lanes432: Tile<i32, { [4, 32] }> = col_lanes32
+            .reshape(const_shape![1, 32])
+            .broadcast(const_shape![4, 32]);
+        let c15_128: Tile<i32, { [128] }> = constant(15i32, const_shape![128]);
+        let c255_128: Tile<i32, { [128] }> = constant(255i32, const_shape![128]);
+        let c4_4: Tile<i32, { [4] }> = constant(4i32, const_shape![4]);
+        let c6_4: Tile<i32, { [4] }> = constant(6i32, const_shape![4]);
+        let c15_4: Tile<i32, { [4] }> = constant(15i32, const_shape![4]);
+        let c63_4: Tile<i32, { [4] }> = constant(63i32, const_shape![4]);
+        let c255_4: Tile<i32, { [4] }> = constant(255i32, const_shape![4]);
+
+        let mut acc4: Tile<f32, { [4] }> = constant(0.0f32, const_shape![4]);
+        let blocks_per_row: i32 = ncols / 256i32;
+        let rows4: Tile<i32, { [4] }> = row_lanes4 + broadcast_scalar(row_base, const_shape![4]);
+        let q4_row_bases4: Tile<i32, { [4] }> =
+            rows4 * broadcast_scalar(blocks_per_row * 144i32, const_shape![4]);
+
+        for block in 0i32..blocks_per_row {
+            let q4_block_bases4: Tile<i32, { [4] }> =
+                q4_row_bases4 + broadcast_scalar(block * 144i32, const_shape![4]);
+            let q4_block_bases432: Tile<i32, { [4, 32] }> = q4_block_bases4
+                .reshape(const_shape![4, 1])
+                .broadcast(const_shape![4, 32]);
+
+            let d_offsets4: Tile<i32, { [4] }> = q4_block_bases4 / constant(2i32, const_shape![4]);
+            let q4_half_4: PointerTile<*mut f16, { [4] }> = q4_half_1.broadcast(const_shape![4]);
+            let d_ptrs: PointerTile<*mut f16, { [4] }> = q4_half_4.offset_tile(d_offsets4);
+            let (d_h4, _d_tok): (Tile<f16, { [4] }>, Token) = load_ptr_tko(
+                d_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                None,
+                Latency::<0>,
+            );
+            let dmin_offsets4: Tile<i32, { [4] }> = d_offsets4 + constant(1i32, const_shape![4]);
+            let dmin_ptrs: PointerTile<*mut f16, { [4] }> = q4_half_4.offset_tile(dmin_offsets4);
+            let (dmin_h4, _dmin_tok): (Tile<f16, { [4] }>, Token) = load_ptr_tko(
+                dmin_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                None,
+                Latency::<0>,
+            );
+            let d4: Tile<f32, { [4] }> = ftof(d_h4, rounding::NearestEven);
+            let dmin4: Tile<f32, { [4] }> = ftof(dmin_h4, rounding::NearestEven);
+            let d432: Tile<f32, { [4, 32] }> = d4
+                .reshape(const_shape![4, 1])
+                .broadcast(const_shape![4, 32]);
+            let dmin432: Tile<f32, { [4, 32] }> = dmin4
+                .reshape(const_shape![4, 1])
+                .broadcast(const_shape![4, 32]);
+
+            for group in 0i32..8i32 {
+                let q4_offsets128: Tile<i32, { [128] }> = (q4_block_bases432
+                    + col_lanes432
+                    + broadcast_scalar(16i32 + (group / 2i32) * 32i32, const_shape![4, 32]))
+                .reshape(const_shape![128]);
+                let q4_i8_128: PointerTile<*mut i8, { [128] }> =
+                    q4_i8_1.broadcast(const_shape![128]);
+                let q4_ptrs: PointerTile<*mut i8, { [128] }> = q4_i8_128.offset_tile(q4_offsets128);
+                let (q4_bytes, _q4_tok): (Tile<i8, { [128] }>, Token) = load_ptr_tko(
+                    q4_ptrs,
+                    ordering::Weak,
+                    None::<scope::TileBlock>,
+                    None,
+                    Some(0i8),
+                    None,
+                    Latency::<0>,
+                );
+                let q4_byte_i32: Tile<i32, { [128] }> = exti(q4_bytes) & c255_128;
+                let shift128: Tile<i32, { [128] }> =
+                    broadcast_scalar((group % 2i32) * 4i32, const_shape![128]);
+                let q4_i32: Tile<i32, { [128] }> = shri(q4_byte_i32, shift128) & c15_128;
+                let q4_f32_128: Tile<f32, { [128] }> = convert_tile(q4_i32);
+                let q4_f32: Tile<f32, { [4, 32] }> = q4_f32_128.reshape(const_shape![4, 32]);
+
+                #[allow(unused_assignments)]
+                let mut scale_i32: Tile<i32, { [4] }> = constant(0i32, const_shape![4]);
+                #[allow(unused_assignments)]
+                let mut min_i32: Tile<i32, { [4] }> = constant(0i32, const_shape![4]);
+                let q4_i8_4: PointerTile<*mut i8, { [4] }> = q4_i8_1.broadcast(const_shape![4]);
+                if group < 4i32 {
+                    let scale_offsets4: Tile<i32, { [4] }> =
+                        q4_block_bases4 + broadcast_scalar(4i32 + group, const_shape![4]);
+                    let scale_ptrs: PointerTile<*mut i8, { [4] }> =
+                        q4_i8_4.offset_tile(scale_offsets4);
+                    let (scale_b4, _scale_tok): (Tile<i8, { [4] }>, Token) = load_ptr_tko(
+                        scale_ptrs,
+                        ordering::Weak,
+                        None::<scope::TileBlock>,
+                        None,
+                        None,
+                        None,
+                        Latency::<0>,
+                    );
+                    let min_offsets4: Tile<i32, { [4] }> =
+                        q4_block_bases4 + broadcast_scalar(8i32 + group, const_shape![4]);
+                    let min_ptrs: PointerTile<*mut i8, { [4] }> = q4_i8_4.offset_tile(min_offsets4);
+                    let (min_b4, _min_tok): (Tile<i8, { [4] }>, Token) = load_ptr_tko(
+                        min_ptrs,
+                        ordering::Weak,
+                        None::<scope::TileBlock>,
+                        None,
+                        None,
+                        None,
+                        Latency::<0>,
+                    );
+                    scale_i32 = exti(scale_b4) & c63_4;
+                    min_i32 = exti(min_b4) & c63_4;
+                } else {
+                    let packed_offsets4: Tile<i32, { [4] }> =
+                        q4_block_bases4 + broadcast_scalar(8i32 + group, const_shape![4]);
+                    let packed_ptrs: PointerTile<*mut i8, { [4] }> =
+                        q4_i8_4.offset_tile(packed_offsets4);
+                    let (packed_b4, _packed_tok): (Tile<i8, { [4] }>, Token) = load_ptr_tko(
+                        packed_ptrs,
+                        ordering::Weak,
+                        None::<scope::TileBlock>,
+                        None,
+                        None,
+                        None,
+                        Latency::<0>,
+                    );
+                    let scale_hi_offsets4: Tile<i32, { [4] }> =
+                        q4_block_bases4 + broadcast_scalar(group, const_shape![4]);
+                    let scale_hi_ptrs: PointerTile<*mut i8, { [4] }> =
+                        q4_i8_4.offset_tile(scale_hi_offsets4);
+                    let (scale_hi_b4, _scale_hi_tok): (Tile<i8, { [4] }>, Token) = load_ptr_tko(
+                        scale_hi_ptrs,
+                        ordering::Weak,
+                        None::<scope::TileBlock>,
+                        None,
+                        None,
+                        None,
+                        Latency::<0>,
+                    );
+                    let min_hi_offsets4: Tile<i32, { [4] }> =
+                        q4_block_bases4 + broadcast_scalar(4i32 + group, const_shape![4]);
+                    let min_hi_ptrs: PointerTile<*mut i8, { [4] }> =
+                        q4_i8_4.offset_tile(min_hi_offsets4);
+                    let (min_hi_b4, _min_hi_tok): (Tile<i8, { [4] }>, Token) = load_ptr_tko(
+                        min_hi_ptrs,
+                        ordering::Weak,
+                        None::<scope::TileBlock>,
+                        None,
+                        None,
+                        None,
+                        Latency::<0>,
+                    );
+                    let packed: Tile<i32, { [4] }> = exti(packed_b4) & c255_4;
+                    let scale_hi: Tile<i32, { [4] }> = exti(scale_hi_b4) & c255_4;
+                    let min_hi: Tile<i32, { [4] }> = exti(min_hi_b4) & c255_4;
+                    scale_i32 =
+                        (packed & c15_4) | shli(shri(scale_hi, c6_4), c4_4, overflow::NoWrap);
+                    min_i32 = shri(packed, c4_4) | shli(shri(min_hi, c6_4), c4_4, overflow::NoWrap);
+                }
+
+                let scale_f32: Tile<f32, { [4] }> = convert_tile(scale_i32);
+                let min_f32: Tile<f32, { [4] }> = convert_tile(min_i32);
+                let scale432: Tile<f32, { [4, 32] }> = scale_f32
+                    .reshape(const_shape![4, 1])
+                    .broadcast(const_shape![4, 32]);
+                let min432: Tile<f32, { [4, 32] }> = min_f32
+                    .reshape(const_shape![4, 1])
+                    .broadcast(const_shape![4, 32]);
+
+                let q8_block_index: i32 = block * 8i32 + group;
+                let q8_block_base: i32 = q8_block_index * 36i32;
+                let d8_offset: Tile<i32, { [1] }> =
+                    broadcast_scalar(q8_block_base / 2i32, const_shape![1]);
+                let d8_ptr: PointerTile<*mut f16, { [1] }> = q8_half_1.offset_tile(d8_offset);
+                let (d8_h_1, _d8_tok): (Tile<f16, { [1] }>, Token) = load_ptr_tko(
+                    d8_ptr,
+                    ordering::Weak,
+                    None::<scope::TileBlock>,
+                    None,
+                    None,
+                    None,
+                    Latency::<0>,
+                );
+                let d8_1: Tile<f32, { [1] }> = ftof(d8_h_1, rounding::NearestEven);
+                let d8_32: Tile<f32, { [32] }> = d8_1.broadcast(const_shape![32]);
+
+                let q8_offsets32: Tile<i32, { [32] }> =
+                    col_lanes32 + broadcast_scalar(q8_block_base + 4i32, const_shape![32]);
+                let q8_i8_32: PointerTile<*mut i8, { [32] }> = q8_i8_1.broadcast(const_shape![32]);
+                let q8_ptrs: PointerTile<*mut i8, { [32] }> = q8_i8_32.offset_tile(q8_offsets32);
+                let (q8_bytes, _q8_tok): (Tile<i8, { [32] }>, Token) = load_ptr_tko(
+                    q8_ptrs,
+                    ordering::Weak,
+                    None::<scope::TileBlock>,
+                    None,
+                    Some(0i8),
+                    None,
+                    Latency::<0>,
+                );
+                let q8_i32: Tile<i32, { [32] }> = exti(q8_bytes);
+                let q8_f32: Tile<f32, { [32] }> = convert_tile(q8_i32);
+                let q8_val32: Tile<f32, { [32] }> = d8_32 * q8_f32;
+                let q8_val432: Tile<f32, { [4, 32] }> = q8_val32
+                    .reshape(const_shape![1, 32])
+                    .broadcast(const_shape![4, 32]);
+
+                let q4_val: Tile<f32, { [4, 32] }> = d432 * scale432 * q4_f32 - dmin432 * min432;
+                let prod: Tile<f32, { [4, 32] }> = q4_val * q8_val432;
+                let partial4: Tile<f32, { [4] }> = reduce_sum(prod, 1i32);
+                acc4 = acc4 + partial4;
+            }
+        }
+
+        let out_base: PointerTile<*mut f32, { [] }> = pointer_to_tile(out_ptr);
+        let out_1: PointerTile<*mut f32, { [1] }> = out_base.reshape(const_shape![1]);
+        let out_4: PointerTile<*mut f32, { [4] }> = out_1.broadcast(const_shape![4]);
+        let out_offsets: Tile<i32, { [4] }> =
+            row_lanes4 + broadcast_scalar(row_base, const_shape![4]);
+        let out_dst: PointerTile<*mut f32, { [4] }> = out_4.offset_tile(out_offsets);
+        store_ptr_tko(
+            out_dst,
+            acc4,
             ordering::Weak,
             None::<scope::TileBlock>,
             None,
@@ -2660,12 +2967,14 @@ pub(crate) fn try_fwd(
     let mut q4k_mmai_tail_events = None;
     let mut q4k_scalar_mmq_events = None;
     let mut q4k_tiled_mmq_events = None;
+    let mut q4k_matvec_b1_rows4_events = None;
     let mut q6k_mmq_events = None;
     let mut q6k_matvec_b1_rows4_events = None;
     let mut q4k_mmai_main_host_ms = None;
     let mut q4k_mmai_tail_host_ms = None;
     let mut q4k_scalar_mmq_host_ms = None;
     let mut q4k_tiled_mmq_host_ms = None;
+    let mut q4k_matvec_b1_rows4_host_ms = None;
     let mut q6k_mmq_host_ms = None;
     let mut q6k_matvec_b1_rows4_host_ms = None;
     let trace_main_kernel: &'static str;
@@ -2720,7 +3029,6 @@ pub(crate) fn try_fwd(
             match w_dtype {
                 GgmlDType::Q4K => {
                     if b_size == 1 {
-                        trace_main_kernel = "q4k_q8_1_matvec_b1_f32";
                         trace_tail_kernel = "none";
                         trace_main_b_size = b_size;
                         trace_tail_b_size = 0;
@@ -2739,24 +3047,53 @@ pub(crate) fn try_fwd(
                                 out_ptr as cutile::cuda_core::sys::CUdeviceptr,
                             )
                         };
-                        let op = unsafe {
-                            q4k_q8_1_matvec_kernel::q4k_q8_1_matvec_b1_f32(
-                                qweight_cutile,
-                                q8_cutile,
-                                out_cutile,
-                                ncols as i32,
-                                nrows as i32,
-                            )
-                        }
-                        .grid((nrows as u32, 1, 1));
+                        if q4k_b1_rows4_enabled() && nrows.is_multiple_of(4) {
+                            trace_main_kernel = "q4k_q8_1_matvec_b1_rows4_f32";
+                            let q4k_rows4_start_event =
+                                record_timing_event(&stream, timing_enabled)?;
+                            let op = unsafe {
+                                q4k_q8_1_matvec_rows4_kernel::q4k_q8_1_matvec_b1_rows4_f32(
+                                    qweight_cutile,
+                                    q8_cutile,
+                                    out_cutile,
+                                    ncols as i32,
+                                    nrows as i32,
+                                )
+                            }
+                            .grid(((nrows / 4) as u32, 1, 1));
 
-                        // SAFETY: all pointers refer to live Candle-owned CUDA allocations.
-                        // The q4 storage and q8 scratch are read-only for this launch; `out`
-                        // is exclusively written. Quantization and matvec are enqueued on the
-                        // same Candle stream, so stream order makes the scratch contents
-                        // visible to cuTile. Candle/cudarc records the output write after the
-                        // cuTile launch below.
-                        unsafe { op.async_on(&cutile_stream) }.map_err(cutile_err)?;
+                            // SAFETY: all pointers refer to live Candle-owned CUDA allocations.
+                            // Each cuTile program owns four contiguous output rows, while the
+                            // Q4K storage and Q8 scratch are read-only and stream-ordered after
+                            // Q8 quantization on Candle's stream.
+                            let q4k_rows4_host_start = std::time::Instant::now();
+                            unsafe { op.async_on(&cutile_stream) }.map_err(cutile_err)?;
+                            q4k_matvec_b1_rows4_host_ms =
+                                Some(q4k_rows4_host_start.elapsed().as_secs_f64() * 1000.0);
+                            let q4k_rows4_end_event = record_timing_event(&stream, timing_enabled)?;
+                            q4k_matvec_b1_rows4_events =
+                                q4k_rows4_start_event.zip(q4k_rows4_end_event);
+                        } else {
+                            trace_main_kernel = "q4k_q8_1_matvec_b1_f32";
+                            let op = unsafe {
+                                q4k_q8_1_matvec_kernel::q4k_q8_1_matvec_b1_f32(
+                                    qweight_cutile,
+                                    q8_cutile,
+                                    out_cutile,
+                                    ncols as i32,
+                                    nrows as i32,
+                                )
+                            }
+                            .grid((nrows as u32, 1, 1));
+
+                            // SAFETY: all pointers refer to live Candle-owned CUDA allocations.
+                            // The q4 storage and q8 scratch are read-only for this launch; `out`
+                            // is exclusively written. Quantization and matvec are enqueued on the
+                            // same Candle stream, so stream order makes the scratch contents
+                            // visible to cuTile. Candle/cudarc records the output write after the
+                            // cuTile launch below.
+                            unsafe { op.async_on(&cutile_stream) }.map_err(cutile_err)?;
+                        }
                     } else if use_mmq_q8_layout
                         && mmai_prefill_enabled()
                         && nrows.is_multiple_of(16)
@@ -3142,12 +3479,31 @@ pub(crate) fn try_fwd(
         let q4k_mmai_tail_ms = elapsed_timing_ms(&q4k_mmai_tail_events)?;
         let q4k_scalar_mmq_ms = elapsed_timing_ms(&q4k_scalar_mmq_events)?;
         let q4k_tiled_mmq_ms = elapsed_timing_ms(&q4k_tiled_mmq_events)?;
+        let q4k_matvec_b1_rows4_ms = elapsed_timing_ms(&q4k_matvec_b1_rows4_events)?;
         let q6k_mmq_ms = elapsed_timing_ms(&q6k_mmq_events)?;
         let q6k_matvec_b1_rows4_ms = elapsed_timing_ms(&q6k_matvec_b1_rows4_events)?;
         let total_gpu_ms = elapsed_timing_ms(&total_gpu_events)?;
+        let decode_matvec_gpu_ms = if b_size == 1 {
+            q4k_matvec_b1_rows4_ms
+                .or(q6k_matvec_b1_rows4_ms)
+                .or(total_gpu_ms)
+        } else {
+            None
+        };
+        let decode_matvec_kernel = if b_size == 1 {
+            trace_main_kernel
+        } else {
+            "n/a"
+        };
+        let estimated_weight_bytes = if b_size == 1 {
+            estimated_decode_weight_bytes(w_dtype, nrows, ncols)
+        } else {
+            None
+        };
+        let estimated_bandwidth_gbps = estimated_gbps(estimated_weight_bytes, decode_matvec_gpu_ms);
         let total_host_ms = total_host_start.elapsed().as_secs_f64() * 1000.0;
         trace_cutile_measurement(format_args!(
-            "cutile_timing dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} main_kernel={} tail_kernel={} main_b_size={} tail_b_size={} q8_quant_ms={} q4k_mmai_main_ms={} q4k_mmai_tail_ms={} q4k_scalar_mmq_ms={} q4k_tiled_mmq_ms={} q6k_mmq_ms={} q6k_matvec_b1_rows4_ms={} total_gpu_ms={} q4k_mmai_main_host_submit_or_jit_ms={} q4k_mmai_tail_host_submit_or_jit_ms={} q4k_scalar_mmq_host_submit_or_jit_ms={} q4k_tiled_mmq_host_submit_or_jit_ms={} q6k_mmq_host_submit_or_jit_ms={} q6k_matvec_b1_rows4_host_submit_or_jit_ms={} total_host_submit_or_jit_ms={:.3}",
+            "cutile_timing dtype={:?} rhs_dtype={:?} nrows={} ncols={} b_size={} main_kernel={} tail_kernel={} main_b_size={} tail_b_size={} q8_quant_ms={} q4k_mmai_main_ms={} q4k_mmai_tail_ms={} q4k_scalar_mmq_ms={} q4k_tiled_mmq_ms={} q4k_matvec_b1_rows4_ms={} q6k_mmq_ms={} q6k_matvec_b1_rows4_ms={} total_gpu_ms={} decode_matvec_kernel={} decode_matvec_gpu_ms={} estimated_weight_bytes={} estimated_gbps={} q4k_mmai_main_host_submit_or_jit_ms={} q4k_mmai_tail_host_submit_or_jit_ms={} q4k_scalar_mmq_host_submit_or_jit_ms={} q4k_tiled_mmq_host_submit_or_jit_ms={} q4k_matvec_b1_rows4_host_submit_or_jit_ms={} q6k_mmq_host_submit_or_jit_ms={} q6k_matvec_b1_rows4_host_submit_or_jit_ms={} total_host_submit_or_jit_ms={:.3}",
             w_dtype,
             rhs.dtype(),
             nrows,
@@ -3162,13 +3518,19 @@ pub(crate) fn try_fwd(
             fmt_timing_ms(q4k_mmai_tail_ms),
             fmt_timing_ms(q4k_scalar_mmq_ms),
             fmt_timing_ms(q4k_tiled_mmq_ms),
+            fmt_timing_ms(q4k_matvec_b1_rows4_ms),
             fmt_timing_ms(q6k_mmq_ms),
             fmt_timing_ms(q6k_matvec_b1_rows4_ms),
             fmt_timing_ms(total_gpu_ms),
+            decode_matvec_kernel,
+            fmt_timing_ms(decode_matvec_gpu_ms),
+            fmt_usize(estimated_weight_bytes),
+            fmt_gbps(estimated_bandwidth_gbps),
             fmt_host_ms(q4k_mmai_main_host_ms),
             fmt_host_ms(q4k_mmai_tail_host_ms),
             fmt_host_ms(q4k_scalar_mmq_host_ms),
             fmt_host_ms(q4k_tiled_mmq_host_ms),
+            fmt_host_ms(q4k_matvec_b1_rows4_host_ms),
             fmt_host_ms(q6k_mmq_host_ms),
             fmt_host_ms(q6k_matvec_b1_rows4_host_ms),
             total_host_ms,
@@ -3346,18 +3708,27 @@ mod tests {
         }
     }
 
-    fn run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(dtype: GgmlDType, q6k_rows4: bool) {
+    fn run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(dtype: GgmlDType, rows4: bool) {
         let _env_guard = QUANT_KERNEL_ENV_LOCK.lock().unwrap();
-        let _rows4_guard = EnvVarGuard::save("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS4");
+        let _q4k_rows4_guard = EnvVarGuard::save("PI_CANDLE_QUANT_CUTILE_Q4K_B1_ROWS4");
+        let _q6k_rows4_guard = EnvVarGuard::save("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS4");
         std::thread::Builder::new()
             .name("pi-ai-candle-worker".to_string())
             .spawn(move || {
                 std::env::set_var("PI_CANDLE_QUANT_KERNEL", "candle");
                 std::env::remove_var("PI_CANDLE_QUANT_FALLBACK");
-                if q6k_rows4 {
-                    std::env::set_var("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS4", "1");
-                } else {
-                    std::env::remove_var("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS4");
+                std::env::remove_var("PI_CANDLE_QUANT_CUTILE_Q4K_B1_ROWS4");
+                std::env::remove_var("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS4");
+                if rows4 {
+                    match dtype {
+                        GgmlDType::Q4K => {
+                            std::env::set_var("PI_CANDLE_QUANT_CUTILE_Q4K_B1_ROWS4", "1")
+                        }
+                        GgmlDType::Q6K => {
+                            std::env::set_var("PI_CANDLE_QUANT_CUTILE_Q6K_B1_ROWS4", "1")
+                        }
+                        _ => {}
+                    }
                 }
 
                 let device = Device::new_cuda(0).unwrap();
@@ -3562,6 +3933,12 @@ mod tests {
     #[ignore = "requires CUDA 13.2+/cuTile runtime and a CUDA device"]
     fn cutile_q4k_q8_1_b1_matches_candle_cuda_matvec() {
         run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q4K, false);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA 13.2+/cuTile runtime and a CUDA device"]
+    fn cutile_q4k_q8_1_b1_rows4_matches_candle_cuda_matvec() {
+        run_cutile_qk_q8_1_b1_matches_candle_cuda_matvec(GgmlDType::Q4K, true);
     }
 
     #[test]
