@@ -68,6 +68,12 @@ fn trace_qwen3_projection_merge(message: impl std::fmt::Display) {
     }
 }
 
+fn trace_qwen3_prealloc_kv(message: impl std::fmt::Display) {
+    if qwen3_projection_merge_trace_enabled() {
+        eprintln!("candle quant-kernel qwen3_prealloc_kv {message}");
+    }
+}
+
 fn qwen3_merged_qkv_enabled() -> bool {
     matches!(
         std::env::var("PI_CANDLE_QWEN3_MERGED_QKV").ok().as_deref(),
@@ -80,6 +86,13 @@ fn qwen3_merged_gate_up_enabled() -> bool {
         std::env::var("PI_CANDLE_QWEN3_MERGED_GATE_UP")
             .ok()
             .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn qwen3_prealloc_kv_enabled() -> bool {
+    matches!(
+        std::env::var("PI_CANDLE_QWEN3_PREALLOC_KV").ok().as_deref(),
         Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
     )
 }
@@ -158,6 +171,168 @@ fn trace_rope_kv_timed<T>(
     );
 
     Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_kv_append_timed<T>(
+    device: &Device,
+    kind: &'static str,
+    phase: &'static str,
+    b: usize,
+    seq_len: usize,
+    offset: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !rope_kv_trace_enabled() {
+        return f();
+    }
+
+    let host_start = Instant::now();
+    #[cfg(feature = "cuda")]
+    let start_event = record_rope_kv_event(device)?;
+    #[cfg(not(feature = "cuda"))]
+    let _ = device;
+
+    let value = f()?;
+
+    #[cfg(feature = "cuda")]
+    let gpu_ms = {
+        let end_event = record_rope_kv_event(device)?;
+        match (start_event, end_event) {
+            (Some(start), Some(end)) => Some(
+                start
+                    .elapsed_ms(&end)
+                    .map_err(|err| candle::Error::Cuda(Box::new(err)))?,
+            ),
+            _ => None,
+        }
+    };
+    #[cfg(not(feature = "cuda"))]
+    let gpu_ms = None;
+
+    let (prealloc_ms, concat_ms) = match kind {
+        "prealloc" => (gpu_ms, None),
+        "concat" => (None, gpu_ms),
+        _ => (None, None),
+    };
+    let host_ms = host_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "candle rope-kv_timing op=kv_append kind={kind} phase={phase} b={b} seq_len={seq_len} offset={offset} num_heads={num_heads} num_kv_heads={num_kv_heads} head_dim={head_dim} kv_append_prealloc_ms={} kv_append_concat_ms={} host_ms={host_ms:.3}",
+        fmt_optional_ms(prealloc_ms),
+        fmt_optional_ms(concat_ms),
+    );
+
+    Ok(value)
+}
+
+#[derive(Debug, Clone)]
+struct PreallocatedGpuKvCache {
+    k: Option<Tensor>,
+    v: Option<Tensor>,
+    current_seq_len: usize,
+    capacity: usize,
+    max_seq_len: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+}
+
+impl PreallocatedGpuKvCache {
+    const INITIAL_CAP: usize = 4096;
+
+    fn new(num_kv_heads: usize, head_dim: usize, max_seq_len: usize) -> Self {
+        Self {
+            k: None,
+            v: None,
+            current_seq_len: 0,
+            capacity: 0,
+            max_seq_len,
+            num_kv_heads,
+            head_dim,
+        }
+    }
+
+    fn current_seq_len(&self) -> usize {
+        self.current_seq_len
+    }
+
+    fn reset(&mut self) {
+        self.current_seq_len = 0;
+    }
+
+    fn target_capacity(&self, needed: usize) -> Result<usize> {
+        if needed > self.max_seq_len {
+            candle::bail!(
+                "Qwen3 preallocated KV cache would exceed max_seq_len: needed={needed} max_seq_len={}",
+                self.max_seq_len
+            )
+        }
+        let min_cap = Self::INITIAL_CAP.min(self.max_seq_len).max(1);
+        let mut cap = self.capacity.max(min_cap);
+        while cap < needed {
+            cap = (cap * 2).min(self.max_seq_len).max(needed);
+        }
+        Ok(cap)
+    }
+
+    fn ensure_capacity(&mut self, needed: usize, device: &Device) -> Result<()> {
+        if self.k.is_some() && needed <= self.capacity {
+            return Ok(());
+        }
+        let new_capacity = self.target_capacity(needed)?;
+        let shape = (1usize, self.num_kv_heads, new_capacity, self.head_dim);
+        let new_k = Tensor::zeros(shape, DType::F32, device)?;
+        let new_v = Tensor::zeros(shape, DType::F32, device)?;
+        if self.current_seq_len != 0 {
+            let old_k = self
+                .k
+                .as_ref()
+                .unwrap()
+                .narrow(2, 0, self.current_seq_len)?;
+            let old_v = self
+                .v
+                .as_ref()
+                .unwrap()
+                .narrow(2, 0, self.current_seq_len)?;
+            new_k.slice_set(&old_k.contiguous()?, 2, 0)?;
+            new_v.slice_set(&old_v.contiguous()?, 2, 0)?;
+        }
+        self.k = Some(new_k.detach());
+        self.v = Some(new_v.detach());
+        self.capacity = new_capacity;
+        Ok(())
+    }
+
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (b, heads, seq_len, head_dim) = k.dims4()?;
+        let (vb, vheads, vseq_len, vhead_dim) = v.dims4()?;
+        if (b, heads, head_dim) != (1, self.num_kv_heads, self.head_dim)
+            || (vb, vheads, vseq_len, vhead_dim) != (1, self.num_kv_heads, seq_len, self.head_dim)
+        {
+            candle::bail!(
+                "Qwen3 preallocated KV cache expected K/V shape [1, {}, seq, {}], got k={:?} v={:?}",
+                self.num_kv_heads,
+                self.head_dim,
+                k.dims(),
+                v.dims()
+            )
+        }
+        let needed = self.current_seq_len + seq_len;
+        self.ensure_capacity(needed, k.device())?;
+        let k = k.to_dtype(DType::F32)?.contiguous()?.detach();
+        let v = v.to_dtype(DType::F32)?.contiguous()?.detach();
+        let k_cache = self.k.as_ref().unwrap();
+        let v_cache = self.v.as_ref().unwrap();
+        k_cache.slice_set(&k, 2, self.current_seq_len)?;
+        v_cache.slice_set(&v, 2, self.current_seq_len)?;
+        self.current_seq_len = needed;
+        Ok((
+            k_cache.narrow(2, 0, self.current_seq_len)?.detach(),
+            v_cache.narrow(2, 0, self.current_seq_len)?.detach(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +484,7 @@ struct AttentionWeights {
     hidden_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: Option<ConcatKvCache>,
+    prealloc_kv_cache: Option<PreallocatedGpuKvCache>,
     interleaved_cache: Option<InterleavedKvCache>,
     raw_cache: Option<RawInterleavedKvCache>,
     span_attn: tracing::Span,
@@ -324,6 +500,7 @@ impl AttentionWeights {
         rms_norm_eps: f64,
         rotary_emb: Arc<RotaryEmbedding>,
         device: &Device,
+        max_seq_len: usize,
         prefix: &str,
     ) -> Result<Self> {
         let num_kv_groups = num_heads / num_kv_heads;
@@ -358,6 +535,18 @@ impl AttentionWeights {
         } else {
             Some(ConcatKvCache::new(2))
         };
+        let prealloc_kv_cache = if !on_cpu && qwen3_prealloc_kv_enabled() {
+            Some(PreallocatedGpuKvCache::new(
+                num_kv_heads,
+                head_dim,
+                max_seq_len,
+            ))
+        } else {
+            if on_cpu && qwen3_prealloc_kv_enabled() {
+                trace_qwen3_prealloc_kv("status=fallback reason=non_cuda_device");
+            }
+            None
+        };
         let interleaved_cache = if on_cpu {
             Some(InterleavedKvCache::new(head_dim))
         } else {
@@ -386,6 +575,7 @@ impl AttentionWeights {
             hidden_size,
             rotary_emb,
             kv_cache,
+            prealloc_kv_cache,
             interleaved_cache,
             raw_cache,
             span_attn,
@@ -541,18 +731,67 @@ impl AttentionWeights {
             }
         } else {
             // Standard matmul attention (no flash)
-            let (k, v) = trace_rope_kv_timed(
-                x.device(),
-                "kv_append",
-                phase,
-                b,
-                l,
-                offset,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                || self.kv_cache.as_mut().unwrap().append(&k, &v),
-            )?;
+            if b != 1 {
+                if let Some(prealloc_kv_cache) = self.prealloc_kv_cache.as_ref() {
+                    if prealloc_kv_cache.current_seq_len() == 0 {
+                        trace_qwen3_prealloc_kv(format_args!(
+                            "status=fallback reason=batch_size_unsupported b={b}"
+                        ));
+                        self.prealloc_kv_cache = None;
+                    } else {
+                        candle::bail!(
+                            "Qwen3 preallocated KV cache only supports b=1, got b={b} with current_seq_len={}",
+                            prealloc_kv_cache.current_seq_len()
+                        )
+                    }
+                }
+            }
+            let (k, v) = if let Some(prealloc_kv_cache) = self.prealloc_kv_cache.as_mut() {
+                match trace_kv_append_timed(
+                    x.device(),
+                    "prealloc",
+                    phase,
+                    b,
+                    l,
+                    offset,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    || prealloc_kv_cache.append(&k, &v),
+                ) {
+                    Ok(kv) => kv,
+                    Err(err) if prealloc_kv_cache.current_seq_len() == 0 => {
+                        trace_qwen3_prealloc_kv(format_args!("status=fallback reason={err}"));
+                        self.prealloc_kv_cache = None;
+                        trace_kv_append_timed(
+                            x.device(),
+                            "concat",
+                            phase,
+                            b,
+                            l,
+                            offset,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            || self.kv_cache.as_mut().unwrap().append(&k, &v),
+                        )?
+                    }
+                    Err(err) => return Err(err),
+                }
+            } else {
+                trace_kv_append_timed(
+                    x.device(),
+                    "concat",
+                    phase,
+                    b,
+                    l,
+                    offset,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    || self.kv_cache.as_mut().unwrap().append(&k, &v),
+                )?
+            };
 
             let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
             let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
@@ -577,6 +816,9 @@ impl AttentionWeights {
 
     fn clear_kv_cache(&mut self) {
         if let Some(c) = &mut self.kv_cache {
+            c.reset();
+        }
+        if let Some(c) = &mut self.prealloc_kv_cache {
             c.reset();
         }
         if let Some(c) = &mut self.interleaved_cache {
@@ -606,6 +848,7 @@ impl LayerWeights {
         rms_norm_eps: f64,
         rotary: Arc<RotaryEmbedding>,
         device: &Device,
+        max_seq_len: usize,
         layer_idx: usize,
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
@@ -620,6 +863,7 @@ impl LayerWeights {
             rms_norm_eps,
             rotary,
             device,
+            max_seq_len,
             &prefix,
         )?;
         let mlp = MlpWeights::new(gg, &prefix)?;
@@ -708,6 +952,7 @@ impl ModelWeights {
                 rms_norm_eps,
                 rotary.clone(),
                 device,
+                max_position_embeddings,
                 i,
             )?);
         }
